@@ -2,6 +2,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models.business import Product
@@ -14,6 +15,7 @@ from app.schemas.materials import (
     MaterialPriceHistorySchema,
     ProductForecastRequest,
     ProductForecastResponse,
+    MaterialBuyingAdviceSchema,
 )
 from app.utils.helpers import safe_divide
 
@@ -27,7 +29,7 @@ router = APIRouter(prefix="/materials", tags=["Raw Materials & Pricing Engine"])
 @router.get("/", response_model=List[RawMaterialSchema])
 async def get_materials(db: AsyncSession = Depends(get_db)):
     """List all raw materials, including their linked product IDs."""
-    result = await db.execute(select(RawMaterial))
+    result = await db.execute(select(RawMaterial).options(selectinload(RawMaterial.products)))
     materials = result.scalars().all()
     
     schemas = []
@@ -52,7 +54,7 @@ async def create_material(obj_in: RawMaterialCreate, db: AsyncSession = Depends(
         
     db.add(db_obj)
     await db.flush()
-    await db.refresh(db_obj)
+    await db.refresh(db_obj, ["products"])
     
     # Store initial price history entry if price is set
     if db_obj.current_unit_price >= 0:
@@ -69,10 +71,93 @@ async def create_material(obj_in: RawMaterialCreate, db: AsyncSession = Depends(
     return schema
 
 
+# ============================================================
+# SEASONAL & PRICE TREND BUYING ADVICE
+# ============================================================
+
+import calendar
+from collections import defaultdict
+
+@router.get("/buying-advice", response_model=List[MaterialBuyingAdviceSchema])
+async def get_buying_advice(db: AsyncSession = Depends(get_db)):
+    """
+    Analyzes historical pricing records to advise:
+    - What timing is best to purchase (seasonality).
+    - What materials to stockpile, delay, or hold.
+    """
+    result = await db.execute(select(RawMaterial))
+    materials = result.scalars().all()
+    
+    advice_list = []
+    for m in materials:
+        hist_result = await db.execute(
+            select(MaterialPriceHistory)
+            .where(MaterialPriceHistory.material_id == m.id)
+            .order_by(MaterialPriceHistory.recorded_at.asc())
+        )
+        history = hist_result.scalars().all()
+        
+        if len(history) < 3:
+            advice_list.append(MaterialBuyingAdviceSchema(
+                material_id=m.id,
+                name=m.name,
+                current_unit_price=m.current_unit_price,
+                historical_average=m.current_unit_price,
+                best_month_to_buy="N/A",
+                advice="INSIGNIFICANT_DATA",
+                justification="Log at least 3 historical price points to enable trend timing analysis."
+            ))
+            continue
+            
+        prices = [h.recorded_price for h in history]
+        avg_price = sum(prices) / len(prices)
+        
+        # Calculate monthly average prices to detect seasonality
+        monthly_prices = defaultdict(list)
+        for h in history:
+            monthly_prices[h.recorded_at.month].append(h.recorded_price)
+            
+        monthly_averages = {}
+        for month, price_list in monthly_prices.items():
+            monthly_averages[month] = sum(price_list) / len(price_list)
+            
+        best_month_num = min(monthly_averages, key=monthly_averages.get)
+        best_month_name = calendar.month_name[best_month_num]
+        
+        price_diff_pct = (m.current_unit_price - avg_price) / (avg_price or 1.0)
+        
+        if price_diff_pct < -0.05:
+            advice = "STOCKPILE"
+            justification = f"Spot price is {abs(price_diff_pct):.0%} lower than average (${avg_price:.2f}). Storing/stockpiling is highly recommended. Best seasonal buy month is {best_month_name}."
+        elif price_diff_pct > 0.05:
+            advice = "DELAY"
+            justification = f"Spot price is {price_diff_pct:.0%} higher than average (${avg_price:.2f}). Delay purchases where possible. Best seasonal buy month is {best_month_name}."
+        else:
+            advice = "HOLD"
+            justification = f"Spot price is stable with historical average (${avg_price:.2f}). Purchase normal operational volumes. Best seasonal buy month is {best_month_name}."
+            
+        advice_list.append(MaterialBuyingAdviceSchema(
+            material_id=m.id,
+            name=m.name,
+            current_unit_price=m.current_unit_price,
+            historical_average=avg_price,
+            best_month_to_buy=best_month_name,
+            advice=advice,
+            justification=justification
+        ))
+        
+    return advice_list
+
+
 @router.get("/{id}", response_model=RawMaterialSchema)
 async def get_material(id: int, db: AsyncSession = Depends(get_db)):
     """Get a raw material by ID."""
-    material = await db.get(RawMaterial, id)
+    result = await db.execute(
+        select(RawMaterial)
+        .where(RawMaterial.id == id)
+        .options(selectinload(RawMaterial.products))
+    )
+    material = result.scalars().first()
     if not material:
         raise HTTPException(status_code=404, detail="Raw material not found")
     
@@ -84,7 +169,12 @@ async def get_material(id: int, db: AsyncSession = Depends(get_db)):
 @router.patch("/{id}", response_model=RawMaterialSchema)
 async def update_material(id: int, obj_in: RawMaterialUpdate, db: AsyncSession = Depends(get_db)):
     """Update a raw material, recording price history if the price changes."""
-    material = await db.get(RawMaterial, id)
+    result = await db.execute(
+        select(RawMaterial)
+        .where(RawMaterial.id == id)
+        .options(selectinload(RawMaterial.products))
+    )
+    material = result.scalars().first()
     if not material:
         raise HTTPException(status_code=404, detail="Raw material not found")
     
@@ -116,7 +206,7 @@ async def update_material(id: int, obj_in: RawMaterialUpdate, db: AsyncSession =
         db.add(history_entry)
         await db.flush()
         
-    await db.refresh(material)
+    await db.refresh(material, ["products"])
     schema = RawMaterialSchema.model_validate(material)
     schema.product_ids = [p.id for p in material.products]
     return schema
@@ -199,3 +289,7 @@ async def forecast_margin(request: ProductForecastRequest, db: AsyncSession = De
         original_margin=original_margin,
         projected_margin=projected_margin,
     )
+
+
+
+

@@ -10,7 +10,7 @@ import {
   uploadFile, uploadSampleDoc,
   getMaterials, getProducts, createMaterial, updateMaterial,
   deleteMaterial, getMaterialPriceHistory, createPriceHistory,
-  getMaterialForecast, getStrategyBrief,
+  getMaterialForecast, getStrategyBrief, getMaterialBuyingAdvice,
 } from './api'
 import { OperationsHeatmap } from './components/OperationsHeatmap'
 import {
@@ -939,14 +939,16 @@ function MaterialsPage() {
   const [forecastLoading, setForecastLoading] = useState(false)
   const [forecastResult, setForecastResult] = useState<any>(null)
   const [histories, setHistories] = useState<Record<number, any[]>>({})
+  const [buyingAdvice, setBuyingAdvice] = useState<any[]>([])
 
   const loadData = useCallback(() => {
     setLoading(true)
-    Promise.all([getMaterials(), getProducts()])
-      .then(async ([mRes, pRes]) => {
+    Promise.all([getMaterials(), getProducts(), getMaterialBuyingAdvice()])
+      .then(async ([mRes, pRes, aRes]) => {
         const mats = mRes.data
         setMaterials(mats)
         setProducts(pRes.data)
+        setBuyingAdvice(aRes.data)
         
         const histMap: Record<number, any[]> = {}
         for (const m of mats) {
@@ -1253,6 +1255,53 @@ function MaterialsPage() {
               )}
             </div>
           )}
+        </div>
+
+        {/* Strategic Procurement Buying Advice */}
+        <div className="col-12 card reveal" style={{ '--i': 2, marginTop: '20px' } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">Strategic Procurement Timing &amp; Stockpile Advice</div>
+              <div className="card-subtitle">Automated pricing trends and seasonal patterns analyzed from log records</div>
+            </div>
+          </div>
+          <div style={{ padding: '20px' }}>
+            {buyingAdvice.length === 0 ? (
+              <div className="empty-state">
+                <p>Register materials and log historical price data points to generate purchasing timing advices.</p>
+              </div>
+            ) : (
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Material</th>
+                    <th>Current Spot Price</th>
+                    <th>Historical Average</th>
+                    <th>Best Month to Buy</th>
+                    <th>Purchasing Timing Advice</th>
+                    <th>AI Trend Justification</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {buyingAdvice.map((adv, idx) => {
+                    const badgeClass = adv.advice === 'STOCKPILE' ? 'green' : adv.advice === 'DELAY' ? 'red' : adv.advice === 'HOLD' ? 'amber' : 'gray'
+                    return (
+                      <tr key={idx}>
+                        <td style={{ fontWeight: 600, color: 'var(--color-ink)' }}>{adv.name}</td>
+                        <td style={{ fontFamily: 'var(--font-mono)' }}>${adv.current_unit_price.toFixed(2)}</td>
+                        <td style={{ fontFamily: 'var(--font-mono)' }}>${adv.historical_average.toFixed(2)}</td>
+                        <td style={{ fontWeight: 600, color: 'var(--color-accent)' }}>{adv.best_month_to_buy}</td>
+                        <td>
+                          <span className={`badge ${badgeClass}`}>{adv.advice}</span>
+                        </td>
+                        <td style={{ fontSize: '0.72rem', color: 'var(--color-ink-2)', maxWidth: '400px' }}>{adv.justification}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
         </div>
       </div>
     </div>

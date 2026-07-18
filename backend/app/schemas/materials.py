@@ -70,3 +70,16 @@ class ProductForecastResponse(BaseModel):
     projected_cogs: float
     original_margin: float
     projected_margin: float
+
+
+# ---------------------------------------------------------------------------
+# Buying Advice (Seasonal & Price Trend Analysis)
+# ---------------------------------------------------------------------------
+class MaterialBuyingAdviceSchema(BaseModel):
+    material_id: int
+    name: str
+    current_unit_price: float
+    historical_average: float
+    best_month_to_buy: Optional[str] = None
+    advice: str  # STOCKPILE | DELAY | HOLD | INSIGNIFICANT_DATA
+    justification: str

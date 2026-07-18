@@ -40,6 +40,9 @@ export const getShipmentMargins = () => api.get('/supply-chain/margins')
 // Strategy Brief API Endpoints
 export const getStrategyBrief = () => api.get('/recommendations/strategy')
 
+// Raw Materials Buying Advice API
+export const getMaterialBuyingAdvice = () => api.get('/materials/buying-advice')
+
 export const uploadFile = (category: string, file: File) => {
   const formData = new FormData()
   formData.append('file', file)

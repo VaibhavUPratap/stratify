@@ -79,21 +79,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         logger.info("Database tables initialised.")
 
         # Programmatic column addition for SQLite schemas updates
+        from sqlalchemy import text
         try:
-            cursor = await conn.execute("PRAGMA table_info(invoices)")
-            columns = await cursor.fetchall()
+            cursor = await conn.execute(text("PRAGMA table_info(invoices)"))
+            columns = cursor.fetchall()
             col_names = [col[1] for col in columns]
             if "purchase_order_id" not in col_names:
                 logger.info("Migrating invoices table: adding purchase_order_id column")
-                await conn.execute("ALTER TABLE invoices ADD COLUMN purchase_order_id INTEGER REFERENCES purchase_orders(id) ON DELETE SET NULL")
+                await conn.execute(text("ALTER TABLE invoices ADD COLUMN purchase_order_id INTEGER REFERENCES purchase_orders(id) ON DELETE SET NULL"))
                 logger.info("invoices table migrated successfully.")
 
-            cursor_cust = await conn.execute("PRAGMA table_info(customers)")
-            columns_cust = await cursor_cust.fetchall()
+            cursor_cust = await conn.execute(text("PRAGMA table_info(customers)"))
+            columns_cust = cursor_cust.fetchall()
             col_names_cust = [col[1] for col in columns_cust]
             if "region" not in col_names_cust:
                 logger.info("Migrating customers table: adding region column")
-                await conn.execute("ALTER TABLE customers ADD COLUMN region VARCHAR(100) DEFAULT 'East'")
+                await conn.execute(text("ALTER TABLE customers ADD COLUMN region VARCHAR(100) DEFAULT 'East'"))
                 logger.info("customers table migrated successfully.")
         except Exception as e:
             logger.error("Lifespan database schema migration failed: %s", e)
