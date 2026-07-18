@@ -152,6 +152,10 @@ class RecommendationHistory(Base):
     confidence_score = Column(Float, default=0.0)
     risk_level = Column(String)
     supporting_evidence = Column(String)
+    roi = Column(Float, default=0.0)
+    business_impact = Column(String)
+    affected_departments = Column(String) # JSON or comma-separated string
+    status = Column(String, default="PENDING") # PENDING, APPROVED, REJECTED, MODIFIED
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
 class DecisionHistory(Base):
@@ -159,6 +163,9 @@ class DecisionHistory(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     recommendation_id = Column(Integer, ForeignKey('recommendation_history.id'))
-    action_taken = Column(String, nullable=False)
+    action_taken = Column(String, nullable=False) # Maps to user_action in docs
     business_outcome = Column(String)
+    modification_notes = Column(String)
+    outcome_revenue_impact = Column(Float, default=0.0)
+    feedback = Column(String)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())

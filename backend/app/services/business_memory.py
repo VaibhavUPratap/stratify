@@ -102,24 +102,49 @@ class BusinessMemoryService:
         ]
 
     # 3. Decision Memory Store & Retrieve
-    async def store_recommendation(self, agent_name: str, recommendation_text: str, confidence_score: float, risk_level: str, supporting_evidence: str) -> RecommendationHistory:
+    async def store_recommendation(
+        self, 
+        agent_name: str, 
+        recommendation_text: str, 
+        confidence_score: float, 
+        risk_level: str, 
+        supporting_evidence: str,
+        roi: float = 0.0,
+        business_impact: str = None,
+        affected_departments: str = None
+    ) -> RecommendationHistory:
         rec = RecommendationHistory(
             agent_name=agent_name,
             recommendation_text=recommendation_text,
             confidence_score=confidence_score,
             risk_level=risk_level,
-            supporting_evidence=supporting_evidence
+            supporting_evidence=supporting_evidence,
+            roi=roi,
+            business_impact=business_impact,
+            affected_departments=affected_departments,
+            status="PENDING"
         )
         self.db.add(rec)
         await self.db.commit()
         await self.db.refresh(rec)
         return rec
 
-    async def store_decision(self, recommendation_id: int, action_taken: str, business_outcome: str = None) -> DecisionHistory:
+    async def store_decision(
+        self, 
+        recommendation_id: int, 
+        action_taken: str, 
+        business_outcome: str = None,
+        modification_notes: str = None,
+        outcome_revenue_impact: float = 0.0,
+        feedback: str = None
+    ) -> DecisionHistory:
         dec = DecisionHistory(
             recommendation_id=recommendation_id,
             action_taken=action_taken,
-            business_outcome=business_outcome
+            business_outcome=business_outcome,
+            modification_notes=modification_notes,
+            outcome_revenue_impact=outcome_revenue_impact,
+            feedback=feedback
         )
         self.db.add(dec)
         await self.db.commit()

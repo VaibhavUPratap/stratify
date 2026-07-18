@@ -19,10 +19,16 @@ class SimulateRequest(BaseModel):
     inventory_decisions: str
     loan_decisions: str
 
+from typing import Dict, Any, List, Optional
+
 class DecisionLogRequest(BaseModel):
     recommendation_id: int
-    action_taken: str # Approve or Decline
-    business_outcome: str = None
+    action_taken: Optional[str] = None # Approve or Decline (frontend compatibility)
+    user_action: Optional[str] = None # APPROVED | REJECTED | MODIFIED (documentation compliance)
+    modification_notes: Optional[str] = None
+    business_outcome: Optional[str] = None
+    outcome_revenue_impact: Optional[float] = 0.0
+    feedback: Optional[str] = None
 
 # DI factories
 def get_ceo_agent(db: AsyncSession = Depends(get_db)) -> CEOAgent:
@@ -138,10 +144,24 @@ async def log_decision(
     if not rec:
         raise HTTPException(status_code=404, detail="Recommendation not found")
         
+    action = request.user_action or request.action_taken or "APPROVED"
+    mapped_status = action.upper()
+    if mapped_status == "APPROVE":
+        mapped_status = "APPROVED"
+    elif mapped_status == "DECLINE" or mapped_status == "REJECT":
+        mapped_status = "REJECTED"
+        
+    # Sync status to the recommendation record
+    rec.status = mapped_status
+    db.add(rec)
+    
     outcome = await memory.store_decision(
         recommendation_id=request.recommendation_id,
-        action_taken=request.action_taken,
-        business_outcome=request.business_outcome or f"Marked {request.action_taken}."
+        action_taken=action,
+        business_outcome=request.business_outcome or f"Marked {action}.",
+        modification_notes=request.modification_notes,
+        outcome_revenue_impact=request.outcome_revenue_impact or 0.0,
+        feedback=request.feedback
     )
     return {"status": "decision_logged", "decision_id": outcome.id}
 
