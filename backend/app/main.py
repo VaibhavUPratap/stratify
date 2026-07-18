@@ -1,63 +1,158 @@
+"""
+SME Business Operating System — FastAPI Application Entrypoint
+
+Phases implemented:
+  Phase 1: Database foundation, CRUD APIs, Business Memory, File Uploads
+  Phase 2: Document Intelligence (PDF/OCR/Excel) + Gemma AI Chat
+  Phase 3: Predictive Intelligence (Revenue, Cashflow, Demand, Risk, Pricing)
+  Phase 4: Multi-Agent Decision Engine (CEO Agent + 6 specialists + Digital Twin)
+
+Architecture:
+  - Async FastAPI with lifespan context (DB init on startup)
+  - API versioned at /api/v1
+  - CORS enabled for local development
+  - Structured logging
+  - All routers registered with descriptive tags
+"""
+
+import logging
+import sys
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .database import engine, Base
-from .models import models # To register tables
-import contextlib
 
-@contextlib.asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Initialize DB on startup
+from app.config import settings
+from app.database import Base, engine
+
+# Import all models so SQLAlchemy registers them before create_all
+import app.models.business  # noqa: F401
+import app.models.history   # noqa: F401
+
+# Routers — Phase 1
+from app.routers.business import router as business_router
+from app.routers.upload import router as upload_router
+from app.routers.dashboard import router as dashboard_router
+
+# Routers — Phase 2
+from app.routers.ai import router as ai_router
+
+# Routers — Phase 3
+from app.routers.forecast import router as forecast_router
+from app.routers.risk import router as risk_router
+
+# Routers — Phase 4
+from app.routers.decision import router as decision_router
+
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lifespan — DB initialisation + teardown
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator:
+    """
+    Application lifespan handler.
+    On startup: creates all SQLAlchemy tables if they don't exist.
+    On shutdown: disposes the async engine connection pool.
+    """
+    logger.info("=== SME OS Starting Up (env=%s) ===", settings.ENVIRONMENT)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    yield
-    # Clean up on shutdown
+        logger.info("Database tables initialised.")
+
+    yield  # Application runs here
+
+    logger.info("=== SME OS Shutting Down ===")
     await engine.dispose()
+    logger.info("Database connections closed.")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI App
+# ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="SME Business Operating System",
+    title="SME Business Operating System API",
+    description=(
+        "Enterprise-grade AI-powered backend for SME business management. "
+        "Covers CRUD operations, document intelligence, predictive analytics, "
+        "multi-agent decision making, and digital twin simulation."
+    ),
     version="1.0.0",
-    lifespan=lifespan
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# Middleware
+# ---------------------------------------------------------------------------
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],           # Restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/")
+
+# ---------------------------------------------------------------------------
+# API v1 Prefix
+# ---------------------------------------------------------------------------
+
+API_V1 = "/api/v1"
+
+# Phase 1 — Core Business Operations
+app.include_router(business_router, prefix=API_V1)
+app.include_router(upload_router, prefix=API_V1)
+app.include_router(dashboard_router, prefix=API_V1)
+
+# Phase 2 — AI Intelligence
+app.include_router(ai_router, prefix=API_V1)
+
+# Phase 3 — Predictive Intelligence
+app.include_router(forecast_router, prefix=API_V1)
+app.include_router(risk_router, prefix=API_V1)
+
+# Phase 4 — Decision Intelligence
+app.include_router(decision_router, prefix=API_V1)
+
+
+# ---------------------------------------------------------------------------
+# Root & Health Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/", tags=["System"])
 async def root():
+    """API root — confirms the service is running."""
     return {
         "service": "SME Business Operating System",
         "version": "1.0.0",
         "status": "operational",
-        "environment": "development",
+        "environment": settings.ENVIRONMENT,
         "docs": "/docs",
-        "api_base": "/api/v1",
-        "phases_active": [
-            "Phase 1: CRUD",
-            "Phase 2: AI",
-            "Phase 3: Predictive",
-            "Phase 4: Decision"
-        ]
+        "api_base": API_V1,
+        "phases_active": ["Phase 1: CRUD", "Phase 2: AI", "Phase 3: Predictive", "Phase 4: Decision"],
     }
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy",
-        "service": "sme-os-backend"
-    }
 
-from .routers import business, upload, dashboard, ai, forecast, risk, decision
-
-# Include routers here...
-app.include_router(business.router, prefix="/api/v1")
-app.include_router(upload.router, prefix="/api/v1")
-app.include_router(dashboard.router, prefix="/api/v1")
-app.include_router(ai.router, prefix="/api/v1")
-app.include_router(forecast.router, prefix="/api/v1")
-app.include_router(risk.router, prefix="/api/v1")
-app.include_router(decision.router, prefix="/api/v1")
+@app.get("/health", tags=["System"])
+async def health_check():
+    """Lightweight health check for load balancer / Docker healthcheck."""
+    return {"status": "healthy", "service": "sme-os-backend"}

@@ -1,195 +1,198 @@
-from fastapi import APIRouter, Depends, HTTPException
+"""
+Decision Intelligence Router — Phase 4 multi-agent decision engine endpoints.
+
+Endpoints:
+  GET  /agents              — Run all specialist agents and return individual reports
+  GET  /recommendations     — Prioritised recommendations from CEO agent
+  POST /simulate            — Digital twin: what-if scenario analysis
+  GET  /decision-history    — Past AI recommendations and user decision outcomes
+  POST /decision-history    — Submit feedback/outcome for a recommendation
+  GET  /explain/{rec_id}    — Explainability: full reasoning for a specific recommendation
+"""
+
+import logging
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from pydantic import BaseModel
-from typing import Dict, Any, List
 
-from ..database import get_db
-from ..services.agent_engine import CEOAgent, FinanceAgent, OperationsAgent, MarketingAgent, SupplierAgent, CustomerAgent, RiskAgent
-from ..services.simulation_engine import SimulationEngineService
-from ..services.business_memory import BusinessMemoryService
-from ..models.models import RecommendationHistory
+from app.database import get_db
+from app.models.history import DecisionHistory, RecommendationHistory
+from app.schemas.decision import (
+    DecisionFeedback,
+    DecisionHistorySchema,
+    ExplainResponse,
+    RecommendationsResponse,
+    SimulationInput,
+    SimulationOutput,
+)
+from app.services.agent_engine import CEOAgent
+from app.services.business_memory import BusinessMemoryService
+from app.services.simulation_engine import SimulationEngineService
 
-router = APIRouter(tags=["Multi-Agent Decision Intelligence"])
+router = APIRouter(tags=["Decision Intelligence Engine"])
+logger = logging.getLogger(__name__)
 
-class SimulateRequest(BaseModel):
-    price_change_pct: float
-    hiring_cost: float
-    supplier_change: str
-    inventory_decisions: str
-    loan_decisions: str
+# Singleton CEO agent instance (stateless — safe to reuse)
+_ceo_agent = CEOAgent()
 
-from typing import Dict, Any, List, Optional
 
-class DecisionLogRequest(BaseModel):
-    recommendation_id: int
-    action_taken: Optional[str] = None # Approve or Decline (frontend compatibility)
-    user_action: Optional[str] = None # APPROVED | REJECTED | MODIFIED (documentation compliance)
-    modification_notes: Optional[str] = None
-    business_outcome: Optional[str] = None
-    outcome_revenue_impact: Optional[float] = 0.0
-    feedback: Optional[str] = None
-
-# DI factories
-def get_ceo_agent(db: AsyncSession = Depends(get_db)) -> CEOAgent:
-    return CEOAgent(db)
-
-def get_simulation_engine_service(db: AsyncSession = Depends(get_db)) -> SimulationEngineService:
-    return SimulationEngineService(db)
-
-def get_business_memory_service(db: AsyncSession = Depends(get_db)) -> BusinessMemoryService:
-    return BusinessMemoryService(db)
+# ============================================================
+# Agents — Run all specialist agents
+# ============================================================
 
 @router.get("/agents")
 async def run_agents(db: AsyncSession = Depends(get_db)):
-    memory = BusinessMemoryService(db)
-    metrics = await memory.get_aggregate_metrics()
-    products = await memory.get_all_products()
-    suppliers = await memory.get_all_suppliers()
-    customers = await memory.get_all_customers()
-    events = await memory.retrieve_events(limit=10)
-    
-    context = {
-        "metrics": metrics,
-        "products": products,
-        "suppliers": suppliers,
-        "customers": customers,
-        "alerts_count": len([e for e in events if e.get("severity") in ["WARNING", "CRITICAL"]])
-    }
-    predictions = {}
-    
-    specialists = [
-        FinanceAgent(),
-        OperationsAgent(),
-        MarketingAgent(),
-        SupplierAgent(),
-        CustomerAgent(),
-        RiskAgent()
-    ]
-    
-    reports = []
-    for agent in specialists:
-        rep = await agent.analyse(context, predictions)
-        reports.append(rep)
-        
+    """
+    Execute all 6 specialist agents and return their individual analysis reports.
+    Does NOT invoke the CEO synthesis — use /recommendations for the full package.
+    """
+    result = await _ceo_agent.run(db)
     return {
-        "status": "Agents executed",
-        "reports": reports
+        "agents": result["agent_reports"],
+        "total_agents": len(result["agent_reports"]),
+        "context_snapshot": result["context_snapshot"],
     }
 
-@router.get("/recommendations")
-async def get_recommendations(
-    ceo: CEOAgent = Depends(get_ceo_agent),
-    memory: BusinessMemoryService = Depends(get_business_memory_service),
-    db: AsyncSession = Depends(get_db)
+
+# ============================================================
+# Recommendations — Full CEO orchestration
+# ============================================================
+
+@router.get("/recommendations", response_model=RecommendationsResponse)
+async def get_recommendations(db: AsyncSession = Depends(get_db)):
+    """
+    Run the full CEO agent pipeline and return prioritised recommendations.
+
+    Pipeline:
+      1. All 6 specialist agents analyse the business
+      2. CEO agent synthesises reports
+      3. Recommendations sorted by confidence × risk weight
+      4. Stored in RecommendationHistory for future retrieval
+    """
+    result = await _ceo_agent.run(db)
+    all_recs = result.get("all_recommendations", [])
+
+    # Persist top recommendations to history
+    for rec in all_recs[:5]:
+        await BusinessMemoryService.store_recommendation(
+            db=db,
+            agent_name=rec["agent_source"],
+            recommendation=rec["recommendation"],
+            reasoning=rec["reasoning"],
+            roi=rec["roi_estimate"],
+            confidence=rec["confidence"],
+            risk_level=rec["risk_level"],
+            business_impact=rec["business_impact"],
+            affected_departments=rec["affected_departments"],
+            supporting_evidence=rec["supporting_evidence"],
+        )
+
+    return RecommendationsResponse(
+        total=len(all_recs),
+        recommendations=all_recs,
+    )
+
+
+# ============================================================
+# Simulate — Digital Twin
+# ============================================================
+
+@router.post("/simulate", response_model=SimulationOutput)
+async def simulate_scenario(
+    scenario: SimulationInput,
+    db: AsyncSession = Depends(get_db),
 ):
-    consensus = await ceo.run_consensus_engine()
-    
-    # Store recommendation text into historical DB so they can be referenced
-    for rec in consensus.get("strategic_decisions", []):
-        q = select(RecommendationHistory).filter(RecommendationHistory.recommendation_text == rec["action"])
-        res = await db.execute(q)
-        existing = res.scalar_one_or_none()
-        if not existing:
-            await memory.store_recommendation(
-                agent_name=rec["agent_name"],
-                recommendation_text=rec["action"],
-                confidence_score=rec["confidence"],
-                risk_level=rec["risk"],
-                supporting_evidence=rec["evidence"]
+    """
+    Digital twin simulation: project the business impact of a what-if scenario.
+
+    Accepts changes to: prices, hiring, supplier strategy, inventory investment,
+    loan financing, and marketing spend.
+
+    Returns projected: revenue, profit, cash flow, risk score, inventory health,
+    and business health score — without modifying live data.
+    """
+    return await SimulationEngineService.simulate(db, scenario)
+
+
+# ============================================================
+# Decision History
+# ============================================================
+
+@router.get("/decision-history", response_model=List[DecisionHistorySchema])
+async def get_decision_history(
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retrieve the history of user decisions on AI recommendations."""
+    decisions = (
+        await db.execute(
+            select(DecisionHistory).order_by(DecisionHistory.timestamp.desc()).limit(limit)
+        )
+    ).scalars().all()
+    return decisions
+
+
+@router.post("/decision-history", response_model=DecisionHistorySchema, status_code=status.HTTP_201_CREATED)
+async def record_decision(feedback: DecisionFeedback, db: AsyncSession = Depends(get_db)):
+    """
+    Record a user's decision on an AI recommendation and the observed business outcome.
+    This closes the feedback loop and improves future agent accuracy.
+    """
+    # Optionally update the recommendation status
+    if feedback.recommendation_id:
+        rec = (
+            await db.execute(
+                select(RecommendationHistory).where(RecommendationHistory.id == feedback.recommendation_id)
             )
-            
-    result = await db.execute(select(RecommendationHistory).order_by(RecommendationHistory.timestamp.desc()).limit(20))
-    recs = result.scalars().all()
-    
-    return [
-        {
-            "id": r.id,
-            "agent_name": r.agent_name,
-            "roi": "Medium-High",
-            "risk": r.risk_level,
-            "confidence": r.confidence_score,
-            "supporting_data": r.supporting_evidence,
-            "action": r.recommendation_text,
-            "reasoning": f"Calculated by {r.agent_name} with confidence {r.confidence_score*100:.1f}%."
-        } for r in recs
-    ]
+        ).scalars().first()
+        if rec:
+            rec.status = feedback.user_action
+            await db.flush()
 
-@router.post("/simulate")
-async def digital_twin_simulate(
-    request: SimulateRequest,
-    sim: SimulationEngineService = Depends(get_simulation_engine_service)
-):
-    return await sim.run_simulation(
-        price_change_pct=request.price_change_pct,
-        hiring_cost=request.hiring_cost,
-        supplier_change=request.supplier_change,
-        inventory_decisions=request.inventory_decisions,
-        loan_decisions=request.loan_decisions
+    decision = DecisionHistory(
+        recommendation_id=feedback.recommendation_id,
+        user_action=feedback.user_action,
+        modification_notes=feedback.modification_notes,
+        business_outcome=feedback.business_outcome,
+        outcome_revenue_impact=feedback.outcome_revenue_impact,
+        feedback=feedback.feedback,
     )
+    db.add(decision)
+    await db.flush()
+    await db.refresh(decision)
+    return decision
 
-@router.get("/decision-history")
-async def get_decision_history(memory: BusinessMemoryService = Depends(get_business_memory_service)):
-    return await memory.retrieve_decisions()
 
-@router.post("/decision-history")
-async def log_decision(
-    request: DecisionLogRequest,
-    memory: BusinessMemoryService = Depends(get_business_memory_service),
-    db: AsyncSession = Depends(get_db)
-):
-    q = select(RecommendationHistory).filter(RecommendationHistory.id == request.recommendation_id)
-    res = await db.execute(q)
-    rec = res.scalar_one_or_none()
+# ============================================================
+# Explainability
+# ============================================================
+
+@router.get("/explain/{recommendation_id}", response_model=ExplainResponse)
+async def explain_recommendation(recommendation_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    Return full explainability data for a specific recommendation.
+
+    Includes: reasoning, evidence, confidence, business impact, affected departments.
+    """
+    rec = (
+        await db.execute(
+            select(RecommendationHistory).where(RecommendationHistory.id == recommendation_id)
+        )
+    ).scalars().first()
+
     if not rec:
-        raise HTTPException(status_code=404, detail="Recommendation not found")
-        
-    action = request.user_action or request.action_taken or "APPROVED"
-    mapped_status = action.upper()
-    if mapped_status == "APPROVE":
-        mapped_status = "APPROVED"
-    elif mapped_status == "DECLINE" or mapped_status == "REJECT":
-        mapped_status = "REJECTED"
-        
-    # Sync status to the recommendation record
-    rec.status = mapped_status
-    db.add(rec)
-    
-    outcome = await memory.store_decision(
-        recommendation_id=request.recommendation_id,
-        action_taken=action,
-        business_outcome=request.business_outcome or f"Marked {action}.",
-        modification_notes=request.modification_notes,
-        outcome_revenue_impact=request.outcome_revenue_impact or 0.0,
-        feedback=request.feedback
+        raise HTTPException(
+            status_code=404,
+            detail=f"Recommendation #{recommendation_id} not found. Generate recommendations first via GET /recommendations.",
+        )
+
+    return ExplainResponse(
+        recommendation_id=rec.id,
+        reason=rec.reasoning or "Reasoning not recorded for this recommendation.",
+        evidence=rec.supporting_evidence or [],
+        confidence=rec.confidence,
+        business_impact=rec.business_impact or "Business impact not specified.",
+        affected_departments=rec.affected_departments or [],
     )
-    return {"status": "decision_logged", "decision_id": outcome.id}
-
-@router.get("/explain/{recommendation_id}")
-async def explain_recommendation(
-    recommendation_id: int,
-    db: AsyncSession = Depends(get_db)
-):
-    q = select(RecommendationHistory).filter(RecommendationHistory.id == recommendation_id)
-    res = await db.execute(q)
-    rec = res.scalar_one_or_none()
-    if not rec:
-        raise HTTPException(status_code=404, detail="Recommendation not found")
-        
-    dept_map = {
-        "FinanceAgent": ["Finance", "Accounting"],
-        "OperationsAgent": ["Procurement", "Logistics", "Warehouse"],
-        "MarketingAgent": ["Sales", "Marketing"],
-        "SupplierAgent": ["Procurement", "Sourcing"],
-        "CustomerAgent": ["Sales", "Customer Support"],
-        "RiskAgent": ["Compliance", "Legal", "Operations"]
-    }
-    depts = dept_map.get(rec.agent_name, ["Executive"])
-    
-    return {
-        "reason": rec.recommendation_text,
-        "evidence": rec.supporting_evidence,
-        "confidence": rec.confidence_score,
-        "business_impact": "Resolves immediate alert indicator flags.",
-        "affected_departments": depts
-    }

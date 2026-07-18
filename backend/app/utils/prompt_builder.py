@@ -1,97 +1,247 @@
-from typing import Dict, Any, List
+"""
+PromptBuilder — Modular, composable LLM prompt construction.
+
+All prompts are built here. No hardcoded prompt strings should exist anywhere else.
+Supports: chat, executive brief, agent briefings, CEO synthesis.
+"""
+
+from typing import Any, Dict, List
+
 
 class PromptBuilder:
-    def __init__(self):
-        pass
+    """
+    Stateless factory for constructing optimised LLM prompt strings.
 
-    def build_system_context(self, company_profile: Dict[str, Any], metrics: Dict[str, Any]) -> str:
-        """
-        Builds the baseline system instruction injection for Gemma, anchoring its identity
-        to the specific company and metrics.
-        """
-        company_name = company_profile.get("name", "our company")
-        industry = company_profile.get("industry", "general SME")
-        cash_balance = company_profile.get("cash_balance", 0.0)
-        
-        ar = metrics.get("accounts_receivable", 0.0)
-        ap = metrics.get("accounts_payable", 0.0)
-        
-        return (
-            f"You are the Core Intelligence Agent of Stratify (SME OS), specifically configured for '{company_name}' (Industry: {industry}).\n"
-            f"Financial Baseline:\n"
-            f"- Current Cash Balance: ${cash_balance:,.2f}\n"
-            f"- Accounts Receivable (AR): ${ar:,.2f}\n"
-            f"- Accounts Payable (AP): ${ap:,.2f}\n"
-            f"Your role is to analyze inputs and provide mathematically grounded, context-aware operational suggestions."
-        )
+    Design goals:
+      - Prompts are data-driven from context dicts — not hardcoded
+      - Each builder method is independently testable
+      - Output is plain text (string) consumed by any LLM endpoint
+    """
 
-    def build_chat_prompt(self, user_question: str, context: Dict[str, Any]) -> str:
-        """
-        Consolidates recent business events, relevant entities (customers, suppliers, products),
-        and the user's question into one optimized prompt.
-        """
+    # ----------------------------------------------------------------
+    # System Preamble
+    # ----------------------------------------------------------------
+
+    _SYSTEM_PREAMBLE = (
+        "You are the Core Intelligence System of the SME Business Operating System (SME-OS).\n"
+        "You are advising the business owner of a small-to-medium enterprise.\n"
+        "Be concise, data-driven, and actionable. Avoid generic platitudes.\n"
+        "Always cite the specific data from the context when making recommendations.\n\n"
+    )
+
+    # ----------------------------------------------------------------
+    # Chat Prompt
+    # ----------------------------------------------------------------
+
+    @classmethod
+    def build_chat_prompt(cls, user_query: str, context: Dict[str, Any]) -> str:
+        """Build a business-aware chat prompt injecting full operational context."""
+        profile = context.get("profile", {})
         recent_events = context.get("recent_events", [])
-        customers = context.get("customers", [])
-        suppliers = context.get("suppliers", [])
-        products = context.get("products", [])
-        
-        # Build section for events
-        events_str = ""
+        low_stock = context.get("low_stock_products", [])
+        top_customers = context.get("top_customers", [])
+        risky_suppliers = context.get("risky_suppliers", [])
+        decision_history = context.get("decision_history", [])
+
+        prompt = cls._SYSTEM_PREAMBLE
+        prompt += "=== BUSINESS CONTEXT ===\n"
+        prompt += f"Company: {profile.get('name', 'N/A')} | Industry: {profile.get('industry', 'N/A')}\n"
+        prompt += f"Cash Balance: ${profile.get('cash_balance', 0):,.2f}\n"
+        prompt += f"Annual Revenue Target: ${profile.get('annual_revenue_target', 0):,.2f}\n\n"
+
         if recent_events:
-            events_str = "\n".join([f"- [{e.get('timestamp')}] {e.get('severity')}: {e.get('description')}" for e in recent_events])
-        else:
-            events_str = "- No recent events logged."
-            
-        # Build section for customers
-        cust_str = ""
-        if customers:
-            cust_str = "\n".join([f"- {c.get('name')} (CLV: ${c.get('clv'):,.2f}, Credit score: {c.get('credit_score')})" for c in customers[:5]])
-        else:
-            cust_str = "- No active customer records."
-            
-        # Build section for suppliers
-        supp_str = ""
-        if suppliers:
-            supp_str = "\n".join([f"- {s.get('name')} (Reliability: {s.get('reliability_score')*100:.1f}%)" for s in suppliers[:5]])
-        else:
-            supp_str = "- No active supplier records."
-            
-        # Build section for products
-        prod_str = ""
-        if products:
-            prod_str = "\n".join([f"- SKU: {p.get('sku')} | {p.get('name')} (Price: ${p.get('price'):,.2f}, Stock: {p.get('stock_level')})" for p in products[:5]])
-        else:
-            prod_str = "- No product records."
+            prompt += "=== RECENT EVENTS (last 10) ===\n"
+            for ev in recent_events[:10]:
+                severity = ev.get("severity", "INFO")
+                evt = ev.get("event_type", "INFO")
+                desc = ev.get("description", "")
+                tstamp = ev.get("timestamp", "")[:10]
+                metadata = ev.get("metadata_json")
 
-        return (
-            f"### Dynamic Context Profile\n\n"
-            f"#### Recent Business Events:\n{events_str}\n\n"
-            f"#### Key Customers:\n{cust_str}\n\n"
-            f"#### Key Suppliers:\n{supp_str}\n\n"
-            f"#### Stock & Product Catalog:\n{prod_str}\n\n"
-            f"### User Question:\n\"{user_question}\"\n\n"
-            f"Answer the user's question clearly. Reference items in the context profile when relevant."
-        )
+                prompt += f"  [{severity}] {tstamp} — {evt}: {desc}"
+                if metadata:
+                    simple_meta = {}
+                    for k, v in metadata.items():
+                        if k == "transactions" and isinstance(v, list):
+                            simple_meta["transactions_count"] = len(v)
+                        elif k == "products" and isinstance(v, list):
+                            simple_meta["products"] = v
+                        else:
+                            simple_meta[k] = v
+                    meta_str = ", ".join([f"{k}: {v}" for k, v in simple_meta.items() if v is not None])
+                    if meta_str:
+                        prompt += f" ({meta_str})"
+                prompt += "\n"
+            prompt += "\n"
 
-    def build_brief_prompt(self, metrics: Dict[str, Any], recent_events: List[Dict[str, Any]]) -> str:
-        """
-        Creates the prompt context for generating the morning executive brief.
-        """
-        events_str = "\n".join([f"- {e.get('severity')}: {e.get('description')}" for e in recent_events[:10]])
-        return (
-            f"Generate a structured Morning Executive Brief for the business.\n"
-            f"Current Stats:\n"
-            f"- Total Sales Volume: ${metrics.get('total_sales_volume', 0.0):,.2f}\n"
-            f"- Accounts Receivable: ${metrics.get('accounts_receivable', 0.0):,.2f}\n"
-            f"- Accounts Payable: ${metrics.get('accounts_payable', 0.0):,.2f}\n\n"
-            f"Recent Events:\n{events_str}\n\n"
-            f"Format the response as pure JSON matching this exact structure:\n"
-            f"{{\n"
-            f"  \"morning_summary\": \"(Paragraph summary of the business health)\",\n"
-            f"  \"critical_alerts\": [\"(alert 1)\", \"(alert 2)\"],\n"
-            f"  \"top_opportunities\": [\"(opportunity 1)\", \"(opportunity 2)\"],\n"
-            f"  \"business_health_summary\": \"(Stable/Improving/Declining)\",\n"
-            f"  \"top_5_actions\": [\"(action 1)\", \"(action 2)\", \"(action 3)\", \"(action 4)\", \"(action 5)\"]\n"
-            f"}}\n"
-            f"Output ONLY valid JSON. No markdown wrappers like ```json."
+        if low_stock:
+            prompt += "=== CRITICAL INVENTORY ALERTS ===\n"
+            for p in low_stock:
+                prompt += f"  ⚠ {p.get('name')} (SKU: {p.get('sku')}) — Stock: {p.get('stock')}, Reorder Point: {p.get('reorder')}\n"
+            prompt += "\n"
+
+        if top_customers:
+            prompt += "=== TOP CUSTOMERS BY LIFETIME VALUE ===\n"
+            for c in top_customers:
+                prompt += f"  • {c.get('name')} — CLV: ${c.get('clv', 0):,.2f}, Credit Score: {c.get('credit_score')}\n"
+            prompt += "\n"
+
+        if risky_suppliers:
+            prompt += "=== AT-RISK SUPPLIERS (lowest reliability) ===\n"
+            for s in risky_suppliers:
+                prompt += f"  • {s.get('name')} — Reliability: {s.get('reliability_score', 0):.0%}, Avg Lead: {s.get('average_lead_days')}d\n"
+            prompt += "\n"
+
+        if decision_history:
+            prompt += "=== RECENT DECISION OUTCOMES ===\n"
+            for d in decision_history:
+                prompt += f"  [{d.get('user_action')}] {d.get('timestamp', '')[:10]} — {d.get('business_outcome', 'No outcome recorded')}\n"
+            prompt += "\n"
+
+        prompt += f"=== OPERATOR QUESTION ===\n{user_query}\n\n"
+        prompt += (
+            "Format your response using structured sections starting with '###' headers, clean Markdown tables (Metric | Value | Status/Action) summarizing the relevant data, and a bulleted list of recommended action steps.\n"
+            "CRITICAL: Only generate sections, tables, and action steps that directly answer the operator's question. Do NOT include tables, sections, or metrics for unrelated areas of the business context."
         )
+        return prompt
+
+    # ----------------------------------------------------------------
+    # Executive Brief Prompt
+    # ----------------------------------------------------------------
+
+    @classmethod
+    def build_executive_brief_prompt(cls, context: Dict[str, Any]) -> str:
+        """Build a prompt that produces a structured JSON executive brief."""
+        profile = context.get("profile", {})
+        events = context.get("recent_events", [])
+        low_stock = context.get("low_stock_products", [])
+
+        prompt = cls._SYSTEM_PREAMBLE
+        prompt += "Generate a morning executive brief for the CEO based on the following operational data.\n\n"
+
+        prompt += f"Company: {profile.get('name')} | Cash: ${profile.get('cash_balance', 0):,.2f}\n"
+        prompt += f"Recent Events: {len(events)} events in memory\n"
+        prompt += f"Low Stock Items: {len(low_stock)} products below reorder point\n\n"
+
+        if events:
+            prompt += "Latest Events:\n"
+            for ev in events[:5]:
+                evt = ev.get("event_type", "")
+                desc = ev.get("description", "")
+                metadata = ev.get("metadata_json")
+                prompt += f"  - {evt}: {desc}"
+                if metadata:
+                    simple_meta = {k: v for k, v in metadata.items() if k not in ("transactions", ("products"))}
+                    meta_str = ", ".join([f"{k}: {v}" for k, v in simple_meta.items() if v is not None])
+                    if meta_str:
+                        prompt += f" ({meta_str})"
+                prompt += "\n"
+
+        prompt += "\nRespond ONLY in valid JSON with this exact structure:\n"
+        prompt += """{
+  "morning_summary": "<2-3 sentence overview of business status>",
+  "critical_alerts": ["<alert 1>", "<alert 2>"],
+  "top_opportunities": ["<opportunity 1>", "<opportunity 2>"],
+  "business_health_summary": "<1-2 sentence health assessment>",
+  "top_actions": ["<action 1>", "<action 2>", "<action 3>"]
+}"""
+        return prompt
+
+    # ----------------------------------------------------------------
+    # Agent-Specific Prompts
+    # ----------------------------------------------------------------
+
+    @classmethod
+    def build_agent_prompt(
+        cls,
+        agent_name: str,
+        agent_role: str,
+        agent_focus: str,
+        context: Dict[str, Any],
+        predictions: Dict[str, Any] = None,
+    ) -> str:
+        """Build a specialist agent briefing prompt."""
+        profile = context.get("profile", {})
+        predictions = predictions or {}
+
+        prompt = (
+            f"You are the {agent_name} of SME-OS — responsible for {agent_role}.\n"
+            f"Your focus area: {agent_focus}\n\n"
+        )
+        prompt += f"Company: {profile.get('name')} | Industry: {profile.get('industry')}\n"
+        prompt += f"Cash Balance: ${profile.get('cash_balance', 0):,.2f}\n\n"
+
+        if predictions:
+            prompt += "=== CURRENT PREDICTIONS ===\n"
+            for key, val in predictions.items():
+                if isinstance(val, dict):
+                    prompt += f"  {key}: {val.get('prediction', 'N/A')}\n"
+            prompt += "\n"
+
+        events = context.get("recent_events", [])
+        if events:
+            prompt += "=== RELEVANT EVENTS ===\n"
+            for ev in events[:5]:
+                desc = ev.get("description", "")
+                metadata = ev.get("metadata_json")
+                prompt += f"  - {desc}"
+                if metadata:
+                    simple_meta = {k: v for k, v in metadata.items() if k not in ("transactions", ("products"))}
+                    meta_str = ", ".join([f"{k}: {v}" for k, v in simple_meta.items() if v is not None])
+                    if meta_str:
+                        prompt += f" ({meta_str})"
+                prompt += "\n"
+            prompt += "\n"
+
+        prompt += (
+            "Provide your analysis as a structured response with:\n"
+            "1. ANALYSIS: <your assessment of the current situation>\n"
+            "2. RECOMMENDATIONS: <3-5 specific, actionable recommendations>\n"
+            "3. RISKS: <key risks in your domain>\n"
+            "4. CONFIDENCE: <HIGH | MEDIUM | LOW>\n"
+        )
+        return prompt
+
+    # ----------------------------------------------------------------
+    # CEO Synthesis Prompt
+    # ----------------------------------------------------------------
+
+    @classmethod
+    def build_ceo_prompt(
+        cls,
+        agent_reports: List[Dict[str, Any]],
+        context: Dict[str, Any],
+        predictions: Dict[str, Any] = None,
+    ) -> str:
+        """Build the CEO Agent prompt that synthesises all specialist agent reports."""
+        profile = context.get("profile", {})
+        predictions = predictions or {}
+
+        prompt = (
+            "You are the CEO Agent of SME-OS — the executive decision-making intelligence.\n"
+            "You have received reports from all specialist agents. Synthesise them into a strategic executive plan.\n\n"
+        )
+        prompt += f"Company: {profile.get('name')} | Cash: ${profile.get('cash_balance', 0):,.2f}\n\n"
+
+        if predictions:
+            prompt += "=== FORECAST SUMMARY ===\n"
+            for key, val in predictions.items():
+                if isinstance(val, dict):
+                    prompt += f"  {key}: {val.get('prediction', 'N/A')} (Confidence: {val.get('confidence_score', 0):.0%})\n"
+            prompt += "\n"
+
+        prompt += "=== AGENT REPORTS ===\n"
+        for report in agent_reports:
+            prompt += f"\n[{report.get('agent_name', 'Unknown Agent')}]\n"
+            for rec in report.get("recommendations", []):
+                prompt += f"  • {rec}\n"
+
+        prompt += (
+            "\nAs CEO Agent, provide:\n"
+            "1. EXECUTIVE SUMMARY: Holistic 3-4 sentence business state\n"
+            "2. TOP 5 PRIORITIES: Most critical items across all agent reports\n"
+            "3. STRATEGIC DECISIONS: 3 key decisions the owner must make this week\n"
+            "4. BUSINESS RISKS: Top 3 risks with severity\n"
+            "5. GROWTH OPPORTUNITIES: 2-3 opportunities to pursue now\n"
+        )
+        return prompt

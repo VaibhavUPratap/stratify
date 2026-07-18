@@ -1,211 +1,374 @@
+"""
+Prediction Engine Service — Statistical and ML-based forecasting for business metrics.
+
+Models implemented:
+  1. Revenue Forecast (90-day rolling mean extrapolation)
+  2. Cash Flow Forecast (AR vs AP net balance projection)
+  3. Demand Forecast (per-product reorder velocity estimation)
+  4. Customer Risk Model (churn probability + payment risk)
+  5. Supplier Risk Model (delivery delay probability)
+  6. Pricing Recommendation (margin-optimised pricing)
+
+Architecture:
+  - All methods are static async — no shared state
+  - Methods accept AsyncSession and return plain dicts (JSON-serialisable)
+  - Designed to be called by both forecast routers and AI agents independently
+"""
+
+import logging
+from typing import Any, Dict, List
+
 import numpy as np
-import pandas as pd
-from typing import Dict, Any, List
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from ..models.models import Sales, Invoice, Product, Customer, Supplier
+
+from app.models.business import Customer, Invoice, Product, Sales, Supplier
+from app.utils.helpers import clamp, safe_divide
+
+logger = logging.getLogger(__name__)
+
 
 class PredictionEngineService:
-    def __init__(self, db: AsyncSession):
-        self.db = db
+    """
+    Stateless collection of forecasting and risk-scoring algorithms.
+    Each method is an independent ML service — no cross-dependencies.
+    """
 
-    async def forecast_revenue(self) -> Dict[str, Any]:
+    # ----------------------------------------------------------------
+    # 1. Revenue Forecast (90 days)
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    async def predict_revenue_90_days(db: AsyncSession) -> Dict[str, Any]:
         """
-        90-day revenue forecast using historical sales velocity and weighted regression.
+        Projects 90-day revenue using rolling historical sales data.
+        Confidence scales with data volume: sparse data → lower confidence.
         """
-        # Fetch sales history
-        result = await self.db.execute(select(Sales))
-        sales_records = result.scalars().all()
-        
-        if not sales_records:
-            return {
-                "prediction": "No historical sales data available to compile forecast.",
-                "confidence_score": 0.0,
-                "important_features": [],
-                "business_impact": "Unable to gauge future runway.",
-                "suggested_action": "Generate baseline sales transactions."
-            }
-            
-        # Parse into pandas for quick time-series processing
-        df = pd.DataFrame([{
-            "date": s.date,
-            "total_price": s.total_price
-        } for s in sales_records])
-        
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-        
-        # Calculate daily sales velocity
-        daily = df.resample("D").sum().fillna(0)
-        mean_daily = daily["total_price"].mean()
-        
-        # Simple trend slope calculation (Lightweight linear regression)
-        y = daily["total_price"].values
-        x = np.arange(len(y))
-        
-        if len(y) > 1:
-            slope, intercept = np.polyfit(x, y, 1)
+        sales_values = (await db.execute(select(Sales.total_price))).scalars().all()
+
+        if len(sales_values) < 3:
+            forecasted = 15000.0
+            confidence = 0.40
+            note = "Insufficient historical data — using baseline estimate."
+        elif len(sales_values) < 20:
+            forecasted = float(np.mean(sales_values) * 90)
+            confidence = 0.60
+            note = "Low data volume — estimate may be unreliable."
         else:
-            slope = 0
-            
-        # Projected 90 days total
-        projected_90d = 0.0
-        last_val = y[-1] if len(y) > 0 else 0
-        for i in range(1, 91):
-            day_val = last_val + slope * i
-            projected_90d += max(0.0, day_val if day_val > 0 else mean_daily)
-            
-        confidence = min(0.95, 0.5 + (len(y) / 100)) # confidence grows with data history
-        
+            # Use exponential weighted mean to give more weight to recent sales
+            arr = np.array(sales_values, dtype=float)
+            weights = np.exp(np.linspace(-1, 0, len(arr)))
+            weighted_mean = float(np.average(arr, weights=weights))
+            forecasted = weighted_mean * 90
+            confidence = clamp(0.5 + len(sales_values) * 0.01, 0.60, 0.95)
+            note = "Based on weighted historical sales velocity."
+
         return {
-            "prediction": f"Projected 90-day revenue: ${projected_90d:,.2f}",
+            "prediction": f"Projected 90-day revenue: ${forecasted:,.2f}",
             "confidence_score": round(confidence, 2),
-            "important_features": ["historical_sales_velocity", "linear_growth_slope"],
-            "business_impact": "A positive trajectory indicates stable sales runway, matching business growth target.",
-            "suggested_action": "Maintain active sales campaigns and watch customer acquisition rates."
+            "important_features": ["historical_sales_velocity", "weighted_mean", "data_volume"],
+            "business_impact": (
+                "Enables accurate cash flow planning, hiring decisions, "
+                "and inventory investment for the next quarter."
+            ),
+            "suggested_action": (
+                "If confidence < 70%, focus on increasing data capture frequency. "
+                "If confidence ≥ 80%, use this figure for budget planning."
+            ),
+            "metadata": {
+                "data_points": len(sales_values),
+                "forecasted_value": round(forecasted, 2),
+                "note": note,
+            },
         }
 
-    async def forecast_cashflow(self) -> Dict[str, Any]:
+    # ----------------------------------------------------------------
+    # 2. Cash Flow Forecast
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    async def predict_cash_flow(db: AsyncSession) -> Dict[str, Any]:
         """
-        30-day cash flow forecast based on outstanding AR/AP balances.
+        Projects net cash movement over 30 days based on AR/AP balance.
         """
-        result = await self.db.execute(select(Invoice))
-        invoices = result.scalars().all()
-        
-        ar_total = sum(inv.total_amount - inv.paid_amount for inv in invoices if inv.invoice_type == "AR" and inv.status != "PAID")
-        ap_total = sum(inv.total_amount - inv.paid_amount for inv in invoices if inv.invoice_type == "AP" and inv.status != "PAID")
-        
-        # Simple net flow
-        net_expected_flow = ar_total - ap_total
-        
-        confidence = 0.85 if invoices else 0.50
-        
+        ar_amounts = (
+            await db.execute(
+                select(Invoice.total_amount).where(
+                    Invoice.customer_id.isnot(None),
+                    Invoice.status.in_(["UNPAID", "PARTIAL"]),
+                )
+            )
+        ).scalars().all()
+
+        ap_amounts = (
+            await db.execute(
+                select(Invoice.total_amount).where(
+                    Invoice.supplier_id.isnot(None),
+                    Invoice.status.in_(["UNPAID", "PARTIAL"]),
+                )
+            )
+        ).scalars().all()
+
+        total_ar = sum(ar_amounts)
+        total_ap = sum(ap_amounts)
+        net_balance = total_ar - total_ap
+        liquidity_ratio = safe_divide(total_ar, total_ap, default=999.0)
+
+        risk = "STABLE" if net_balance >= 0 else "LIQUIDITY_WARNING"
+        if net_balance < -10000:
+            risk = "CRITICAL"
+
         return {
-            "prediction": f"Expected 30-day net cash impact: ${net_expected_flow:+,.2f} (AR: ${ar_total:,.2f}, AP: ${ap_total:,.2f})",
-            "confidence_score": confidence,
-            "important_features": ["outstanding_accounts_receivable", "upcoming_accounts_payable"],
-            "business_impact": "Positive flow increases cash balance runway; negative flow suggests liquidity strain.",
-            "suggested_action": "Expedite follow-ups on overdue AR invoices to ensure short-term solvency."
+            "prediction": (
+                f"Expected 30-day net cash change: ${net_balance:+,.2f}. "
+                f"AR: ${total_ar:,.2f} | AP: ${total_ap:,.2f}. "
+                f"Liquidity Ratio: {liquidity_ratio:.2f}"
+            ),
+            "confidence_score": 0.82,
+            "important_features": ["accounts_receivable", "accounts_payable", "payment_terms"],
+            "business_impact": (
+                "Cash shortfalls can interrupt supplier payments and halt operations. "
+                "Surplus cash should be deployed into inventory or short-term growth."
+            ),
+            "suggested_action": (
+                "Accelerate AR collection if net balance is negative. "
+                "Consider invoice financing for immediate liquidity relief."
+            ),
+            "metadata": {
+                "total_ar": round(total_ar, 2),
+                "total_ap": round(total_ap, 2),
+                "net_balance": round(net_balance, 2),
+                "risk_level": risk,
+                "liquidity_ratio": round(liquidity_ratio, 2),
+            },
         }
 
-    async def forecast_demand(self) -> List[Dict[str, Any]]:
-        """
-        Predicts future product demand and recommends reorder quantity.
-        """
-        result = await self.db.execute(select(Product))
-        products = result.scalars().all()
-        
-        demand_forecasts = []
-        for p in products:
-            # Basic demand estimation based on stock level vs reorder point
-            is_low = p.stock_level <= p.reorder_point
-            projected_demand = int(p.reorder_quantity * 0.8)
-            suggested_reorder = p.reorder_quantity if is_low else 0
-            
-            demand_forecasts.append({
-                "product_id": p.id,
-                "sku": p.sku,
-                "name": p.name,
-                "prediction": f"Projected 30-day demand: {projected_demand} units. Recommended reorder: {suggested_reorder} units.",
-                "confidence_score": 0.80,
-                "important_features": ["current_stock_level", "reorder_point"],
-                "business_impact": "Prevents stockouts on core product items." if is_low else "Stock level optimal.",
-                "suggested_action": f"Create replenishment PO for {suggested_reorder} units from supplier." if is_low else "No action needed."
-            })
-            
-        return demand_forecasts
+    # ----------------------------------------------------------------
+    # 3. Demand Forecast
+    # ----------------------------------------------------------------
 
-    async def predict_customer_risk(self) -> List[Dict[str, Any]]:
-        result = await self.db.execute(select(Customer))
-        customers = result.scalars().all()
-        
-        risk_reports = []
-        for c in customers:
-            # Heuristic calculation for credit risk and payment delay
-            late_prob = 0.1
-            if c.credit_score < 600:
-                late_prob = 0.65
-            elif c.credit_score < 700:
-                late_prob = 0.35
-                
-            risk_reports.append({
-                "customer_id": c.id,
-                "name": c.name,
-                "prediction": f"Late Payment Probability: {late_prob*100:.1f}%. Predicted CLV: ${c.clv:,.2f}.",
+    @staticmethod
+    async def predict_demand(db: AsyncSession) -> List[Dict[str, Any]]:
+        """
+        Per-product demand estimation with reorder quantity recommendation.
+        """
+        products = (await db.execute(select(Product))).scalars().all()
+        predictions = []
+
+        for product in products:
+            # Estimate demand velocity from historical sales quantity
+            sales_quantities = (
+                await db.execute(
+                    select(Sales.quantity).where(Sales.product_id == product.id)
+                )
+            ).scalars().all()
+
+            if sales_quantities:
+                avg_demand_per_period = float(np.mean(sales_quantities))
+                est_30d_demand = int(avg_demand_per_period * 3)  # scale to ~30 days
+            else:
+                est_30d_demand = product.reorder_quantity  # default estimate
+
+            shortfall = max(0, est_30d_demand - product.stock_level)
+            urgency = "IMMEDIATE" if product.stock_level == 0 else (
+                "HIGH" if product.stock_level <= product.reorder_point else "NORMAL"
+            )
+            confidence = clamp(0.5 + len(sales_quantities) * 0.02, 0.50, 0.90)
+
+            predictions.append({
+                "product_id": product.id,
+                "sku": product.sku,
+                "name": product.name,
+                "prediction": f"Estimated 30-day demand: {est_30d_demand} units (urgency: {urgency})",
+                "confidence_score": round(confidence, 2),
+                "important_features": ["historical_sales_velocity", "current_stock", "reorder_point"],
+                "business_impact": (
+                    "Stockouts cost an estimated 4-8% of revenue in lost sales. "
+                    "Over-stocking ties up capital and increases holding costs."
+                ),
+                "suggested_action": f"Place order for {shortfall or product.reorder_quantity} units of {product.sku}.",
+                "metadata": {
+                    "current_stock": product.stock_level,
+                    "reorder_point": product.reorder_point,
+                    "estimated_30d_demand": est_30d_demand,
+                    "suggested_order_qty": shortfall or product.reorder_quantity,
+                    "urgency": urgency,
+                },
+            })
+
+        return predictions
+
+    # ----------------------------------------------------------------
+    # 4. Customer Risk Model
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    async def predict_customer_risk(db: AsyncSession) -> List[Dict[str, Any]]:
+        """
+        Multi-factor customer risk assessment: churn probability + late payment risk + CLV.
+        """
+        customers = (await db.execute(select(Customer))).scalars().all()
+        results = []
+
+        for customer in customers:
+            # Churn model: low credit score + low CLV = high churn risk
+            churn_prob = 0.10
+            if customer.credit_score < 550:
+                churn_prob += 0.45
+            elif customer.credit_score < 650:
+                churn_prob += 0.25
+            elif customer.credit_score < 700:
+                churn_prob += 0.10
+
+            if customer.clv < 500:
+                churn_prob += 0.15
+            if customer.is_active == 0:
+                churn_prob = 0.95  # Already churned
+
+            churn_prob = clamp(churn_prob, 0.0, 1.0)
+            late_payment_risk = "HIGH" if customer.credit_score < 620 else (
+                "MEDIUM" if customer.credit_score < 700 else "LOW"
+            )
+
+            risk_label = "HIGH" if churn_prob > 0.50 else ("MEDIUM" if churn_prob > 0.25 else "LOW")
+
+            results.append({
+                "customer_id": customer.id,
+                "name": customer.name,
+                "prediction": (
+                    f"Churn Probability: {churn_prob:.0%} | "
+                    f"Late Payment Risk: {late_payment_risk} | "
+                    f"Customer Risk: {risk_label}"
+                ),
                 "confidence_score": 0.85,
-                "important_features": ["credit_score", "payment_terms_days"],
-                "business_impact": "High late payment likelihood impacts cash flow liquidity directly.",
-                "suggested_action": "Apply stricter credit limit or require partial advance payments." if late_prob > 0.3 else "Maintain standard credit settings."
+                "churn_probability": round(churn_prob, 3),
+                "late_payment_risk": late_payment_risk,
+                "clv": customer.clv,
+                "important_features": ["credit_score", "customer_lifetime_value", "activity_status"],
+                "business_impact": (
+                    "High churn customers represent lost recurring revenue. "
+                    "Late payment risk increases DSO and cash flow pressure."
+                ),
+                "suggested_action": (
+                    "Offer retention incentive for HIGH churn risk customers. "
+                    "Require upfront payment from HIGH late-payment-risk accounts."
+                    if churn_prob > 0.40 else
+                    "Monitor quarterly. Introduce loyalty programme for mid-tier CLV customers."
+                ),
+                "metadata": {
+                    "credit_score": customer.credit_score,
+                    "credit_limit": customer.credit_limit,
+                    "risk_level": risk_label,
+                },
             })
-        return risk_reports
 
-    async def predict_supplier_risk(self) -> List[Dict[str, Any]]:
-        result = await self.db.execute(select(Supplier))
-        suppliers = result.scalars().all()
-        
-        risk_reports = []
-        for s in suppliers:
-            delay_prob = 1.0 - s.reliability_score
-            price_risk = "HIGH" if s.reliability_score < 0.8 else "LOW"
-            
-            risk_reports.append({
-                "supplier_id": s.id,
-                "name": s.name,
-                "prediction": f"Delivery Delay Probability: {delay_prob*100:.1f}%. Procurement Price Increase Risk: {price_risk}.",
-                "confidence_score": 0.90,
-                "important_features": ["reliability_score", "average_lead_days"],
-                "business_impact": "High delay probability risks stock-outs and production assembly freezes.",
-                "suggested_action": "Seek secondary backup vendors to mitigate supply concentration risk." if delay_prob > 0.2 else "Maintain current supply flow."
+        return results
+
+    # ----------------------------------------------------------------
+    # 5. Supplier Risk Model
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    async def predict_supplier_risk(db: AsyncSession) -> List[Dict[str, Any]]:
+        """
+        Supplier risk: delivery delay probability, reliability trend, price increase risk.
+        """
+        suppliers = (await db.execute(select(Supplier))).scalars().all()
+        results = []
+
+        for supplier in suppliers:
+            delay_risk_prob = 1.0 - supplier.reliability_score
+            delay_risk_label = "HIGH" if delay_risk_prob > 0.30 else (
+                "MEDIUM" if delay_risk_prob > 0.15 else "LOW"
+            )
+
+            # Price increase risk: longer lead times + low reliability = higher risk
+            price_risk = "HIGH" if (supplier.average_lead_days > 21 and supplier.reliability_score < 0.70) else (
+                "MEDIUM" if supplier.average_lead_days > 14 else "LOW"
+            )
+
+            delay_ratio = safe_divide(supplier.total_delayed_orders, supplier.total_orders_placed, 0.0)
+
+            results.append({
+                "supplier_id": supplier.id,
+                "name": supplier.name,
+                "prediction": (
+                    f"Delivery Delay Risk: {delay_risk_label} ({delay_risk_prob:.0%}) | "
+                    f"Price Increase Risk: {price_risk} | "
+                    f"Historical Delay Rate: {delay_ratio:.0%}"
+                ),
+                "confidence_score": 0.88,
+                "delay_risk": delay_risk_label,
+                "reliability_score": supplier.reliability_score,
+                "important_features": ["reliability_score", "average_lead_days", "delay_history"],
+                "business_impact": (
+                    "Supplier delays cascade to stockouts, lost sales, and customer dissatisfaction. "
+                    "Price increases directly compress operating margins."
+                ),
+                "suggested_action": (
+                    f"{'Immediately source backup supplier — HIGH risk of disruption.' if delay_risk_label == 'HIGH' else 'Maintain dual-sourcing strategy for key SKUs.'} "
+                    f"Negotiate fixed-price contracts to hedge against price increase risk."
+                ),
+                "metadata": {
+                    "reliability_score": supplier.reliability_score,
+                    "average_lead_days": supplier.average_lead_days,
+                    "delay_rate": round(delay_ratio, 3),
+                    "price_risk": price_risk,
+                },
             })
-        return risk_reports
 
-    async def recommend_pricing(self) -> List[Dict[str, Any]]:
-        result = await self.db.execute(select(Product))
-        products = result.scalars().all()
-        
-        pricing_recs = []
-        for p in products:
-            # Optimize price based on unit cost and markup margin
-            current_margin = (p.price - p.cost) / p.price if p.price > 0 else 0
-            optimal_price = p.cost * 1.45 # 45% standard markup target
-            
-            pricing_recs.append({
-                "product_id": p.id,
-                "sku": p.sku,
-                "name": p.name,
-                "prediction": f"Recommended Optimal Price: ${optimal_price:,.2f} (Current: ${p.price:,.2f}, Cost: ${p.cost:,.2f})",
+        return results
+
+    # ----------------------------------------------------------------
+    # 6. Pricing Recommendation
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    async def pricing_recommendation(db: AsyncSession) -> List[Dict[str, Any]]:
+        """
+        Compute optimal pricing for each product based on cost, margin targets, and market position.
+        """
+        products = (await db.execute(select(Product))).scalars().all()
+        results = []
+
+        for product in products:
+            current_margin = safe_divide(product.price - product.cost, product.price, 0.0)
+
+            # Target: 35% gross margin minimum
+            target_price = product.cost * 1.35
+            if product.price >= target_price:
+                # Already at or above target — can we push higher?
+                optimal_price = round(product.price * 1.05, 2)  # +5% uplift test
+                action = f"Test a 5% price increase to ${optimal_price:.2f} — current margin is healthy."
+                revenue_uplift = (optimal_price - product.price) * max(product.stock_level, 10)
+            else:
+                # Price below margin target — recommend increase
+                optimal_price = round(target_price, 2)
+                action = (
+                    f"Raise price from ${product.price:.2f} → ${optimal_price:.2f} "
+                    f"to achieve 35% gross margin threshold."
+                )
+                revenue_uplift = (optimal_price - product.price) * max(product.stock_level, 10)
+
+            profit_per_unit = optimal_price - product.cost
+            demand_impact = "Minimal" if (optimal_price - product.price) / product.price < 0.10 else "Moderate"
+
+            results.append({
+                "product_id": product.id,
+                "sku": product.sku,
+                "name": product.name,
+                "current_price": product.price,
+                "recommended_price": optimal_price,
+                "expected_profit_per_unit": round(profit_per_unit, 2),
+                "expected_revenue_uplift": round(revenue_uplift, 2),
+                "demand_impact": demand_impact,
                 "confidence_score": 0.78,
-                "important_features": ["unit_cost", "current_markup_margin"],
-                "business_impact": f"Adjusting pricing improves GPM from {current_margin*100:.1f}% to 31.0%.",
-                "suggested_action": f"Increase selling price by ${optimal_price - p.price:,.2f} to hit margin target." if optimal_price > p.price else "Pricing is margin-optimal."
+                "suggested_action": action,
+                "metadata": {
+                    "current_margin_pct": round(current_margin * 100, 2),
+                    "cost": product.cost,
+                    "target_margin_pct": 35.0,
+                },
             })
-        return pricing_recs
 
-    async def forecast_inventory(self) -> List[Dict[str, Any]]:
-        """
-        Predicts: Stockout probability, Dead Inventory, and Reorder Date.
-        """
-        result = await self.db.execute(select(Product))
-        products = result.scalars().all()
-        
-        inventory_forecasts = []
-        for p in products:
-            stockout_risk = "HIGH" if p.stock_level < p.reorder_point else "LOW"
-            dead_stock = "YES" if p.stock_level > p.reorder_quantity * 2 else "NO"
-            
-            # Predict reorder date (simple linear countdown)
-            import datetime
-            reorder_days = max(1, int(p.stock_level * 0.5))
-            predicted_date = (datetime.date.today() + datetime.timedelta(days=reorder_days)).isoformat()
-            
-            inventory_forecasts.append({
-                "product_id": p.id,
-                "sku": p.sku,
-                "name": p.name,
-                "prediction": f"Stockout Risk: {stockout_risk}. Dead Stock: {dead_stock}. Predicted Reorder Date: {predicted_date}.",
-                "confidence_score": 0.83,
-                "important_features": ["current_stock_level", "reorder_point", "sales_velocity"],
-                "business_impact": "High stockout risk disrupts order processing flow." if stockout_risk == "HIGH" else "Stock is stable.",
-                "suggested_action": f"Reorder immediately before {predicted_date}." if stockout_risk == "HIGH" else "Monitor next weekly cycle."
-            })
-        return inventory_forecasts
+        return results

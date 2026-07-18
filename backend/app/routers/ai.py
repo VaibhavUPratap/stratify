@@ -1,114 +1,149 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
-import json
+"""
+AI Router — Ollama-powered chat and executive intelligence endpoints.
+
+Endpoints:
+    POST /ai/chat              — Context-aware business Q&A via the local Gemma model
+    GET  /ai/executive-brief   — Structured morning executive brief
+
+Falls back gracefully when Ollama is offline.
+"""
+
 import logging
-from typing import Dict, Any
+from typing import Any, Dict
 
-from ..database import get_db
-from ..services.business_memory import BusinessMemoryService
-from ..services.ollama_client import OllamaClient
-from ..utils.prompt_builder import PromptBuilder
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.database import get_db
+from app.schemas.business import ChatRequest, ChatResponse
+from app.services.business_memory import BusinessMemoryService
+from app.services.ollama_client import OllamaClient
+from app.utils.prompt_builder import PromptBuilder
+
+router = APIRouter(prefix="/ai", tags=["Ollama AI Intelligence"])
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/ai", tags=["AI Intelligence"])
 
-class ChatRequest(BaseModel):
-    question: str
 
-# Dependency Providers for loose coupling (SOLID)
-def get_ollama_client() -> OllamaClient:
-    return OllamaClient()
+# ---------------------------------------------------------------------------
+# Chat Endpoint
+# ---------------------------------------------------------------------------
 
-def get_prompt_builder() -> PromptBuilder:
-    return PromptBuilder()
+@router.post("/chat", response_model=ChatResponse)
+async def business_chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
+    """
+    AI-powered business chat endpoint.
+
+    Pipeline:
+      1. Compile business context from live DB
+      2. Build optimised prompt via PromptBuilder
+      3. Call Gemma (Ollama) → return response
+      4. Fallback to rule-based response if Gemma offline
+    """
+    context = await BusinessMemoryService.compile_context(db)
+    prompt = PromptBuilder.build_chat_prompt(request.question, context)
+
+    context_summary = {
+        "low_stock_count": len(context.get("low_stock_products", [])),
+        "recent_events_count": len(context.get("recent_events", [])),
+        "company": context.get("profile", {}).get("name", "N/A"),
+    }
+
+    try:
+        ai_response, model_used = await OllamaClient.chat(prompt)
+        return ChatResponse(
+            response=ai_response,
+            model_used=model_used,
+            context_summary=context_summary,
+        )
+    except Exception as exc:
+        logger.warning("Ollama backend unavailable (%s) — serving fallback response.", exc)
+
+    # Intelligent rule-based fallback
+    low_stock = context.get("low_stock_products", [])
+    events = context.get("recent_events", [])
+    fallback_msg = (
+        f"### Operational Status Summary [Offline Mode]\n\n"
+        f"Your local AI Core is currently offline. Showing live database coordinates:\n\n"
+        f"| Metric | Live Value | Status / Alert |\n"
+        f"|---|---|---|\n"
+        f"| **Cash Balance** | ${context.get('profile', {}).get('cash_balance', 0):,.2f} | Operating Liquidity |\n"
+        f"| **Low Stock Items** | {len(low_stock)} | {f'⚠ Action required on {len(low_stock)} products' if low_stock else 'Healthy'} |\n"
+        f"| **Recent Events** | {len(events)} | Audit Log Active |\n\n"
+        f"Please connect the Ollama daemon with the configured model (**{settings.OLLAMA_MODEL}**) to reactivate full AI analysis."
+    )
+    return ChatResponse(
+        response=fallback_msg,
+        model_used="system-fallback",
+        context_summary=context_summary,
+    )
+
+
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Ollama Status Endpoint
+# ---------------------------------------------------------------------------
 
 @router.get("/ollama-status")
-async def get_ollama_status(client: OllamaClient = Depends(get_ollama_client)):
-    return await client.check_status()
+async def get_ollama_status():
+    """
+    Check the connection to Ollama and confirm if the configured models are loaded.
+    """
+    return await OllamaClient.status()
 
-@router.post("/chat")
-async def chat_with_gemma(
-    request: ChatRequest, 
-    db: AsyncSession = Depends(get_db),
-    client: OllamaClient = Depends(get_ollama_client),
-    builder: PromptBuilder = Depends(get_prompt_builder)
-):
-    # 1. Retrieve database context
-    memory = BusinessMemoryService(db)
-    
-    company_profile = await memory.get_company_profile()
-    metrics = await memory.get_aggregate_metrics()
-    customers = await memory.get_all_customers()
-    suppliers = await memory.get_all_suppliers()
-    products = await memory.get_all_products()
-    recent_events = await memory.retrieve_events(limit=10)
-    
-    # 2. Package context object
-    context_obj = {
-        "recent_events": recent_events,
-        "customers": customers,
-        "suppliers": suppliers,
-        "products": products
-    }
-    
-    # 3. Build optimized dynamic prompts
-    system_context = builder.build_system_context(company_profile, metrics)
-    prompt = builder.build_chat_prompt(request.question, context_obj)
-    
-    # 4. Invoke LLM client
-    response_text = await client.generate_response(prompt, system_context)
-    
-    # Log interaction
-    await memory.store_event(
-        event_type="ai_chat_query",
-        description=f"User asked: '{request.question[:40]}...'. AI replied.",
-        severity="INFO",
-        source="system",
-        metadata_dict={"question": request.question, "response": response_text[:100]}
-    )
-    
-    return {
-        "response": response_text,
-        "model_used": client.model,
-        "context_summary": {
-            "events_loaded": len(recent_events),
-            "customers_loaded": len(customers),
-            "suppliers_loaded": len(suppliers),
-            "products_loaded": len(products)
-        }
-    }
+
+# ---------------------------------------------------------------------------
+# Executive Brief
+# ---------------------------------------------------------------------------
 
 @router.get("/executive-brief")
-async def generate_executive_brief(
-    db: AsyncSession = Depends(get_db),
-    client: OllamaClient = Depends(get_ollama_client),
-    builder: PromptBuilder = Depends(get_prompt_builder)
-):
-    memory = BusinessMemoryService(db)
-    metrics = await memory.get_aggregate_metrics()
-    recent_events = await memory.retrieve_events(limit=10)
-    
-    prompt = builder.build_brief_prompt(metrics, recent_events)
-    raw_response = await client.generate_response(prompt)
-    
+async def executive_brief(db: AsyncSession = Depends(get_db)):
+    """
+    Generate a structured morning executive brief.
+
+    Returns JSON with: morning_summary, critical_alerts, top_opportunities,
+    business_health_summary, top_actions.
+    """
+    context = await BusinessMemoryService.compile_context(db)
+    prompt = PromptBuilder.build_executive_brief_prompt(context)
+
     try:
-        cleaned = raw_response.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        cleaned = cleaned.strip()
-        
-        brief_data = json.loads(cleaned)
-    except Exception as e:
-        logger.warning(f"Failed to parse LLM response into JSON: {e}. Raw response: {raw_response}")
-        brief_data = {
-            "morning_summary": raw_response if raw_response else "Failed to compile summary.",
-            "critical_alerts": [e.get("description") for e in recent_events if e.get("severity") == "WARNING"][:3],
-            "top_opportunities": ["Optimize accounts payable timeline"],
-            "business_health_summary": "Stable",
-            "top_5_actions": ["Review unpaid invoices", "Verify stock status"]
-        }
-        
-    return brief_data
+        brief = await OllamaClient.chat_json(prompt)
+        if "raw" not in brief:
+            return brief
+    except Exception as exc:
+        logger.warning("Executive brief AI unavailable (%s) — serving structured fallback.", exc)
+
+    # Structured fallback computed from real context data
+    low_stock = context.get("low_stock_products", [])
+    events = context.get("recent_events", [])
+    profile = context.get("profile", {})
+
+    return {
+        "morning_summary": (
+            f"Good morning. {profile.get('name', 'Your business')} is operating with "
+            f"a cash balance of ${profile.get('cash_balance', 0):,.2f}. "
+            f"{len(events)} business events were recorded in the last cycle."
+        ),
+        "critical_alerts": (
+            [f"{len(low_stock)} products are below reorder threshold and require immediate restocking."]
+            if low_stock else ["No critical inventory alerts at this time."]
+        ),
+        "top_opportunities": [
+            "Review top customer CLV data and implement a loyalty programme.",
+            "Consolidate supplier base to reduce procurement overhead.",
+            "Identify high-margin products for targeted promotion.",
+        ],
+        "business_health_summary": (
+            "Business operations appear stable. Focus on cash flow management "
+            "and resolving any overdue accounts receivable."
+        ),
+        "top_actions": [
+            f"Reorder stock for {len(low_stock)} products at or below reorder point.",
+            "Follow up on any overdue customer invoices.",
+            "Review supplier reliability scores and address underperformers.",
+            "Analyse this month's revenue vs target and adjust sales strategy.",
+        ],
+    }

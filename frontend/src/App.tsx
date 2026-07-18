@@ -1,747 +1,2011 @@
-import { useState, useEffect } from 'react';
-import { api } from './api';
-import type { DashboardMetrics, BusinessHealth, AlertItem, TimelineEvent, ForecastResponse, DemandForecastResponse, RiskResponse, AgentReport, RecommendationItem, SimulationResult } from './api';
+import { useState, useEffect, useCallback } from 'react'
+import './index.css'
+import {
+  getDashboard, getHealth, getAlerts, getTimeline,
+  getRevenueForecast, getCashflowForecast,
+  getAgents,
+  simulate, sendChat, getExecutiveBrief,
+  getCustomerRisk, getSupplierRisk, getPricing,
+  getDecisionHistory,
+  uploadFile, uploadSampleDoc,
+} from './api'
+import {
+  LayoutDashboard,
+  TrendingUp,
+  ShieldAlert,
+  Bot,
+  MessageSquare,
+  FileText,
+  History,
+  Activity,
+  ArrowUpRight,
+  DollarSign,
+  Users,
+  Truck,
+  Play,
+  Send,
+  CheckCircle2,
+  Calendar,
+  Sparkles,
+  Sliders,
+  DollarSign as MoneyIcon,
+  Upload,
+  Sun,
+  Moon,
+} from 'lucide-react'
 
-function App() {
-  const [theme, setTheme] = useState('dark');
-  const [currentPage, setCurrentPage] = useState<'dashboard' | 'forecast' | 'risk' | 'agents' | 'simulate' | 'chat' | 'upload' | 'history'>('dashboard');
-  
-  // Dashboard & Metrics State
-  const [metrics, setMetrics] = useState<DashboardMetrics | null>(null);
-  const [health, setHealth] = useState<BusinessHealth | null>(null);
-  const [alerts, setAlerts] = useState<AlertItem[]>([]);
-  const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
-  
-  // Forecast States
-  const [revForecast, setRevForecast] = useState<ForecastResponse | null>(null);
-  const [cashForecast, setCashForecast] = useState<ForecastResponse | null>(null);
-  const [demandForecast, setDemandForecast] = useState<DemandForecastResponse[]>([]);
-  const [inventoryForecast, setInventoryForecast] = useState<DemandForecastResponse[]>([]);
-  
-  // Risk & Pricing
-  const [custRisks, setCustRisks] = useState<RiskResponse[]>([]);
-  const [suppRisks, setSuppRisks] = useState<RiskResponse[]>([]);
-  const [pricingRecs, setPricingRecs] = useState<any[]>([]);
+// ─── Types ────────────────────────────────────────────────────
+type Page = 'dashboard' | 'forecast' | 'risk' | 'agents' | 'simulate' | 'chat' | 'brief' | 'history' | 'upload'
 
-  // Agent Engine
-  const [agentReports, setAgentReports] = useState<AgentReport[]>([]);
-  const [recommendations, setRecommendations] = useState<RecommendationItem[]>([]);
-  const [explanation, setExplanation] = useState<any>(null);
+// ─── Helpers ──────────────────────────────────────────────────
+const fmt = (n: number) =>
+  n >= 1_000_000 ? `$${(n / 1_000_000).toFixed(2)}M`
+    : n >= 1_000 ? `$${(n / 1_000).toFixed(1)}K`
+      : `$${n.toFixed(2)}`
 
-  // Digital Twin Simulation State
-  const [priceChange, setPriceChange] = useState(0.0);
-  const [hiringCost, setHiringCost] = useState(0.0);
-  const [supplierChange, setSupplierChange] = useState('standard');
-  const [inventoryDecision, setInventoryDecision] = useState('standard');
-  const [loanDecision, setLoanDecision] = useState('no_loan');
-  const [simResult, setSimResult] = useState<SimulationResult | null>(null);
-  const [simulating, setSimulating] = useState(false);
+const pct = (n: number) => `${(n * 100).toFixed(0)}%`
 
-  // Chat State
-  const [question, setQuestion] = useState('');
-  const [chatHistory, setChatHistory] = useState<Array<{ sender: 'user' | 'gemma'; text: string }>>([]);
-  const [chatLoading, setChatLoading] = useState(false);
+const AGENT_META: Record<string, { icon: string; color: string; border: string }> = {
+  FinanceAgent: { icon: '💰', color: 'rgba(16,185,129,0.08)', border: 'var(--color-success)' },
+  OperationsAgent: { icon: '⚙️', color: 'rgba(59,130,246,0.08)', border: 'var(--color-accent)' },
+  MarketingAgent: { icon: '📣', color: 'rgba(245,158,11,0.08)', border: 'var(--color-warning)' },
+  SupplierAgent: { icon: '🚚', color: 'rgba(139,92,246,0.08)', border: 'oklch(65% 0.16 300)' },
+  CustomerAgent: { icon: '👥', color: 'rgba(6,182,212,0.08)', border: 'var(--color-info)' },
+  RiskAgent: { icon: '🛡️', color: 'rgba(239,68,68,0.08)', border: 'var(--color-error)' },
+}
 
-  // Upload States
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
-  const [uploadType, setUploadType] = useState<'invoice' | 'gst' | 'bank' | 'excel'>('invoice');
-  const [uploadStatus, setUploadStatus] = useState<string>('');
-  const [parsedMetadata, setParsedMetadata] = useState<any>(null);
+// ─── Smooth Number Ticker Component (A11y Compliant - Static Mode) ───
+function NumberTicker({ value, formatFn = (n: number) => String(n) }: { value: number; formatFn?: (n: number) => string; duration?: number }) {
+  return <span className="aria-live-polite">{formatFn(value)}</span>
+}
 
-  // History State
-  const [decisionHistory, setDecisionHistory] = useState<any[]>([]);
+// ─── Inline Sparkline Vector Component ────────────────────────
+function Sparkline({ data, color = 'var(--color-accent)' }: { data: number[]; color?: string }) {
+  const width = 80
+  const height = 24
 
-  // Apply Theme class
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
-  }, [theme]);
+  const minVal = Math.min(...data)
+  const maxVal = Math.max(...data)
+  const range = maxVal - minVal || 1
 
-  // Load Dashboard baseline on mount
-  useEffect(() => {
-    loadDashboardData();
-  }, []);
+  const getX = (idx: number) => (idx / (data.length - 1)) * width
+  const getY = (val: number) => height - 1.5 - ((val - minVal) / range) * (height - 3)
 
-  const loadDashboardData = async () => {
-    try {
-      const dash = await api.getDashboard();
-      setMetrics(dash.metrics);
-      
-      const bh = await api.getBusinessHealth();
-      setHealth(bh);
-      
-      const al = await api.getAlerts();
-      setAlerts(al);
-      
-      const tl = await api.getTimeline();
-      setTimeline(tl);
-    } catch (e) {
-      console.error('Failed to load dashboard:', e);
-    }
-  };
-
-  // Load contextual tab data
-  useEffect(() => {
-    if (currentPage === 'forecast') {
-      api.getRevenueForecast().then(setRevForecast);
-      api.getCashflowForecast().then(setCashForecast);
-      api.getDemandForecast().then(setDemandForecast);
-      api.getInventoryForecast().then(setInventoryForecast);
-    } else if (currentPage === 'risk') {
-      api.getCustomerRisks().then(setCustRisks);
-      api.getSupplierRisks().then(setSuppRisks);
-      api.getPricingRecommendations().then(setPricingRecs);
-    } else if (currentPage === 'agents') {
-      api.getAgentReports().then(res => setAgentReports(res.reports));
-      api.getRecommendations().then(setRecommendations);
-    } else if (currentPage === 'history') {
-      api.getDecisionHistory().then(setDecisionHistory);
-    }
-  }, [currentPage]);
-
-  const handleChat = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!question.trim()) return;
-    
-    const userQ = question;
-    setChatHistory(prev => [...prev, { sender: 'user', text: userQ }]);
-    setQuestion('');
-    setChatLoading(true);
-    
-    try {
-      const res = await api.sendChat(userQ);
-      setChatHistory(prev => [...prev, { sender: 'gemma', text: res.response }]);
-    } catch (err) {
-      setChatHistory(prev => [...prev, { sender: 'gemma', text: 'Error fetching AI response.' }]);
-    } finally {
-      setChatLoading(false);
-    }
-  };
-
-  const handleSimulate = async () => {
-    setSimulating(true);
-    try {
-      const res = await api.simulate({
-        price_change_pct: priceChange,
-        hiring_cost: hiringCost,
-        supplier_change: supplierChange,
-        inventory_decisions: inventoryDecision,
-        loan_decisions: loanDecision
-      });
-      setSimResult(res);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setSimulating(false);
-    }
-  };
-
-  const handleUpload = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!uploadFile) return;
-    setUploadStatus('Processing document...');
-    setParsedMetadata(null);
-    try {
-      const res = await api.uploadFile(uploadType, uploadFile);
-      setUploadStatus('Document processed & saved to Business Memory.');
-      setParsedMetadata(res.parsed_metadata);
-      loadDashboardData(); // Refresh timeline event
-    } catch (e) {
-      setUploadStatus('Failed to upload document.');
-    }
-  };
-
-  const handleDecision = async (id: number, action: 'Approve' | 'Decline') => {
-    try {
-      await api.logDecision(id, action);
-      // Reload recommendations to update state
-      api.getRecommendations().then(setRecommendations);
-      alert(`Recommendation successfully logged as: ${action}`);
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  const handleExplain = async (id: number) => {
-    try {
-      const exp = await api.explainRecommendation(id);
-      setExplanation(exp);
-    } catch (e) {
-      console.error(e);
-    }
-  };
+  let path = ''
+  data.forEach((val, i) => {
+    const x = getX(i)
+    const y = getY(val)
+    if (i === 0) path += `M ${x} ${y}`
+    else path += ` L ${x} ${y}`
+  })
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', backgroundColor: 'var(--color-paper)' }}>
-      {/* Sidebar Navigation */}
-      <aside style={{ width: '260px', borderRight: '1px solid var(--color-rule)', display: 'flex', flexDirection: 'column', padding: 'var(--space-md)', background: 'var(--color-paper-2)' }}>
-        <div style={{ marginBottom: 'var(--space-xl)' }}>
-          <h1 style={{ fontSize: 'var(--text-lg)', margin: 0, fontWeight: '700' }}>Stratify</h1>
-          <span style={{ color: 'var(--color-muted)', fontSize: 'var(--text-xs)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>SME Operating System</span>
-        </div>
-        
-        <nav style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2xs)', flexGrow: 1 }}>
-          {[
-            { id: 'dashboard', label: 'Console' },
-            { id: 'forecast', label: 'Forecasts' },
-            { id: 'risk', label: 'Risk Models' },
-            { id: 'agents', label: 'CEO Agents' },
-            { id: 'simulate', label: 'Digital Twin' },
-            { id: 'chat', label: 'Gemma Chat' },
-            { id: 'upload', label: 'Document Ingestion' },
-            { id: 'history', label: 'Decision Logs' }
-          ].map(tab => (
-            <button 
-              key={tab.id}
-              onClick={() => setCurrentPage(tab.id as any)}
-              className={currentPage === tab.id ? 'btn-primary' : 'btn-secondary'}
-              style={{
-                textAlign: 'left',
-                justifyContent: 'flex-start',
-                borderLeft: currentPage === tab.id ? '4px solid var(--color-accent)' : '1px solid transparent',
-                borderRadius: '0 var(--radius-button) var(--radius-button) 0'
-              }}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </nav>
+    <svg width={width} height={height} style={{ overflow: 'visible', opacity: 0.75, pointerEvents: 'none' }}>
+      <path d={path} fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
 
-        <div style={{ marginTop: 'auto', borderTop: '1px solid var(--color-rule)', paddingTop: 'var(--space-md)' }}>
-          <button className="btn-secondary" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} style={{ width: '100%' }}>
-            Toggle {theme === 'dark' ? 'Light' : 'Dark'} Mode
-          </button>
-        </div>
-      </aside>
+// ─── Interactive Telemetry Chart Component ───────────────────
+function TelemetryChart({ baseValue, confidence, color = 'var(--color-accent)', secondaryColor = 'var(--color-accent-dim)', unit = '$', days = 90 }: { baseValue: number; confidence: number; color?: string; secondaryColor?: string; unit?: string; days?: number }) {
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
+  const [hoverPos, setHoverPos] = useState({ x: 0, y: 0 })
 
-      {/* Main Workbench Viewport */}
-      <main style={{ flexGrow: 1, padding: 'var(--space-xl)', overflowY: 'auto' }}>
-        {/* Header telemetry status */}
-        {health && (
-          <div className="flex-between" style={{ borderBottom: '1px solid var(--color-rule)', paddingBottom: 'var(--space-md)', marginBottom: 'var(--space-xl)' }}>
+  type DataPoint = {
+    day: number
+    value: number
+    lower: number
+    upper: number
+  }
+  const pointsCount = 12
+  const dataPoints: DataPoint[] = []
+
+  for (let i = 0; i < pointsCount; i++) {
+    const progress = i / (pointsCount - 1)
+    const trend = baseValue * (0.85 + progress * 0.3)
+    const cycle = Math.sin(progress * Math.PI * 2.5) * (baseValue * 0.04)
+    const val = trend + cycle
+    const uncertaintyRange = (baseValue * 0.14) * (1 - confidence * 0.4) * (1 + progress * 1.3)
+
+    dataPoints.push({
+      day: Math.round(progress * days),
+      value: val,
+      lower: val - uncertaintyRange,
+      upper: val + uncertaintyRange,
+    })
+  }
+
+  const width = 500
+  const height = 180
+  const paddingX = 45
+  const paddingY = 20
+
+  const chartWidth = width - paddingX * 2
+  const chartHeight = height - paddingY * 2
+
+  const minVal = Math.min(...dataPoints.map(d => d.lower)) * 0.96
+  const maxVal = Math.max(...dataPoints.map(d => d.upper)) * 1.04
+  const valRange = maxVal - minVal || 1
+
+  const getX = (index: number) => paddingX + (index / (pointsCount - 1)) * chartWidth
+  const getY = (val: number) => paddingY + chartHeight - ((val - minVal) / valRange) * chartHeight
+
+  let linePath = ''
+  dataPoints.forEach((d, i) => {
+    const x = getX(i)
+    const y = getY(d.value)
+    if (i === 0) linePath += `M ${x} ${y}`
+    else linePath += ` L ${x} ${y}`
+  })
+
+  let boundsCoords = ''
+  dataPoints.forEach((d, i) => {
+    boundsCoords += `${getX(i)},${getY(d.upper)} `
+  })
+  for (let i = pointsCount - 1; i >= 0; i--) {
+    const d = dataPoints[i]
+    boundsCoords += `${getX(i)},${getY(d.lower)} `
+  }
+
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement, MouseEvent>) => {
+    const svgRect = e.currentTarget.getBoundingClientRect()
+    const mouseX = e.clientX - svgRect.left
+    const relativeX = (mouseX - paddingX) / chartWidth
+    const approxIndex = Math.round(relativeX * (pointsCount - 1))
+    const index = Math.max(0, Math.min(pointsCount - 1, approxIndex))
+
+    setHoveredIndex(index)
+    setHoverPos({
+      x: getX(index),
+      y: getY(dataPoints[index].value),
+    })
+  }
+
+  const handleMouseLeave = () => {
+    setHoveredIndex(null)
+  }
+
+  const formatTooltipValue = (v: number) => {
+    if (unit === '$') return fmt(v)
+    return String(v.toFixed(1))
+  }
+
+  return (
+    <div style={{ position: 'relative', width: '100%', marginTop: 'var(--space-sm)' }}>
+      <svg
+        width="100%"
+        height={height}
+        viewBox={`0 0 ${width} ${height}`}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={handleMouseLeave}
+        style={{ overflow: 'visible', cursor: 'crosshair' }}
+      >
+        {/* Gridlines */}
+        {[0, 0.25, 0.5, 0.75, 1].map((p, idx) => {
+          const val = minVal + p * valRange
+          const y = getY(val)
+          return (
+            <g key={idx}>
+              <line x1={paddingX} y1={y} x2={width - paddingX} y2={y} stroke="var(--color-rule-2)" strokeWidth="1" strokeDasharray="3,3" />
+              <text x={paddingX - 8} y={y + 3} textAnchor="end" fill="var(--color-muted)" style={{ fontFamily: 'var(--font-mono)', fontSize: '8px' }}>
+                {unit === '$' ? fmt(val) : val.toFixed(0)}
+              </text>
+            </g>
+          )
+        })}
+
+        {/* X Axis */}
+        {dataPoints.filter((_, i) => i % 3 === 0).map((d, idx) => {
+          const x = getX(dataPoints.indexOf(d))
+          return (
+            <g key={idx}>
+              <line x1={x} y1={height - paddingY} x2={x} y2={height - paddingY + 4} stroke="var(--color-rule)" strokeWidth="1" />
+              <text x={x} y={height - paddingY + 12} textAnchor="middle" fill="var(--color-muted)" style={{ fontFamily: 'var(--font-mono)', fontSize: '8px' }}>
+                T+{d.day}d
+              </text>
+            </g>
+          )
+        })}
+
+        {/* Confidence Shading */}
+        <polygon points={boundsCoords} fill={secondaryColor} />
+
+        {/* Line */}
+        <path d={linePath} fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+
+        {/* Focus Crosshair */}
+        {hoveredIndex !== null && (
+          <g>
+            <line x1={hoverPos.x} y1={paddingY} x2={hoverPos.x} y2={height - paddingY} stroke="var(--color-rule)" strokeWidth="1" strokeDasharray="2,2" />
+            <circle cx={hoverPos.x} cy={hoverPos.y} r="4" fill={color} stroke="var(--color-paper)" strokeWidth="1.5" />
+          </g>
+        )}
+      </svg>
+
+      {/* Dynamic Tooltip Box */}
+      {hoveredIndex !== null && (
+        <div style={{
+          position: 'absolute',
+          top: hoverPos.y - 50 < 8 ? 8 : hoverPos.y - 50,
+          left: hoverPos.x + 12 > width - 130 ? hoverPos.x - 135 : hoverPos.x + 12,
+          background: 'var(--color-paper-3)',
+          border: '1px solid var(--color-rule)',
+          borderRadius: '4px',
+          padding: '4px var(--space-xs)',
+          zIndex: 10,
+          pointerEvents: 'none',
+          boxShadow: 'var(--shadow-card)',
+          transition: 'all 80ms var(--ease-out)',
+        }}>
+          <div style={{ fontSize: '8px', fontFamily: 'var(--font-mono)', color: 'var(--color-muted)', textTransform: 'uppercase', marginBottom: '2px' }}>
+            Day T+{dataPoints[hoveredIndex].day} Projection
+          </div>
+          <div style={{ fontSize: '11px', fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--color-ink)' }}>
+            {formatTooltipValue(dataPoints[hoveredIndex].value)}
+          </div>
+          <div style={{ fontSize: '7.5px', fontFamily: 'var(--font-mono)', color: 'var(--color-muted)', whiteSpace: 'nowrap' }}>
+            Range: {formatTooltipValue(dataPoints[hoveredIndex].lower)} - {formatTooltipValue(dataPoints[hoveredIndex].upper)}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+// ─── Skeletons ────────────────────────────────────────────────
+function DashboardPageSkeleton() {
+  return (
+    <div className="page-body">
+      <div className="bento-grid">
+        {/* KPI Metrics */}
+        {[0, 1, 2, 3].map((i) => (
+          <div key={i} className="col-3 metric-tile reveal" style={{ '--i': i } as any}>
+            <div className="metric-tile-header">
+              <span className="skeleton skeleton-text short" style={{ height: '14px' }} />
+              <div className="skeleton skeleton-circle" style={{ width: '14px', height: '14px' }} />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginTop: 'var(--space-2xs)' }}>
+              <div className="skeleton skeleton-value" />
+              <div className="skeleton skeleton-sparkline" />
+            </div>
+          </div>
+        ))}
+
+        {/* Row 2: Health telemetry & Alerts */}
+        <div className="col-6 row-2 card reveal" style={{ '--i': 4 } as any}>
+          <div className="card-header">
             <div>
-              <h2 style={{ margin: 0, fontSize: 'var(--text-xl)' }}>
-                {currentPage.charAt(0).toUpperCase() + currentPage.slice(1)} Workbench
-              </h2>
-              <span style={{ fontSize: 'var(--text-sm)', color: 'var(--color-ink-2)' }}>Apex Industrial Solutions</span>
+              <div className="skeleton skeleton-title" style={{ width: '120px' }} />
+              <div className="skeleton skeleton-text medium" style={{ width: '180px' }} />
             </div>
-            <div className="flex-center" style={{ gap: 'var(--space-md)' }}>
-              <div style={{ textAlign: 'right' }}>
-                <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>Corporate Health Score</span>
-                <div style={{ fontWeight: '600', color: health.health_score > 70 ? 'var(--color-success)' : 'var(--color-warning)' }}>
-                  {health.health_score}/100
+            <span className="skeleton" style={{ width: '60px', height: '18px', borderRadius: '4px' }} />
+          </div>
+          <div className="health-ring-wrap" style={{ margin: 'var(--space-xs) 0', display: 'flex', gap: 'var(--space-md)' }}>
+            <div className="skeleton skeleton-circle" style={{ width: '96px', height: '96px', flexShrink: 0 }} />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2xs)', flex: 1 }}>
+              {[0, 1, 2, 3].map((j) => (
+                <div key={j} style={{ display: 'flex', justifyContent: 'space-between', paddingBottom: '4px', borderBottom: '1px solid var(--color-rule-2)' }}>
+                  <span className="skeleton skeleton-text short" />
+                  <span className="skeleton skeleton-text" style={{ width: '50px' }} />
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="col-6 row-2 card reveal" style={{ '--i': 5 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="skeleton skeleton-title" style={{ width: '140px' }} />
+              <div className="skeleton skeleton-text medium" style={{ width: '200px' }} />
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2xs)' }}>
+            {[0, 1, 2].map((j) => (
+              <div key={j} className="alert-item" style={{ border: '1px solid var(--color-rule-2)', padding: '10px' }}>
+                <span className="skeleton" style={{ width: '40px', height: '14px', borderRadius: '3px' }} />
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', flex: 1, marginLeft: '8px' }}>
+                  <span className="skeleton skeleton-text medium" />
+                  <span className="skeleton skeleton-text long" />
                 </div>
               </div>
-              <div style={{ textAlign: 'right', borderLeft: '1px solid var(--color-rule)', paddingLeft: 'var(--space-md)' }}>
-                <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>Total Cash Balance</span>
-                <div style={{ fontWeight: '600', color: 'var(--color-ink)' }}>
-                  $185,200.50
+            ))}
+          </div>
+        </div>
+
+        {/* Row 3: Event Log & Secondary Metrics */}
+        <div className="col-8 card reveal" style={{ '--i': 6 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="skeleton skeleton-title" style={{ width: '120px' }} />
+              <div className="skeleton skeleton-text medium" style={{ width: '180px' }} />
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2xs)' }}>
+            {[0, 1, 2].map((j) => (
+              <div key={j} style={{ display: 'flex', gap: 'var(--space-xs)', padding: '8px 0', borderBottom: '1px solid var(--color-rule-2)' }}>
+                <div className="skeleton skeleton-circle" style={{ width: '8px', height: '8px', marginTop: '4px', flexShrink: 0 }} />
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  <span className="skeleton skeleton-text short" />
+                  <span className="skeleton skeleton-text long" />
                 </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="col-4 card reveal" style={{ '--i': 7 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="skeleton skeleton-title" style={{ width: '100px' }} />
+              <div className="skeleton skeleton-text medium" style={{ width: '120px' }} />
+            </div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-2xs)', height: '100%' }}>
+            {[0, 1, 2, 3].map((j) => (
+              <div key={j} style={{ background: 'var(--color-paper-3)', padding: 'var(--space-2xs)', borderRadius: 'var(--radius-card)', border: '1px solid var(--color-rule-2)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <span className="skeleton skeleton-text short" />
+                <span className="skeleton skeleton-value" style={{ width: '80px', height: '20px' }} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ForecastPageSkeleton() {
+  return (
+    <div className="page-body">
+      <div className="bento-grid">
+        {/* Left Column */}
+        <div className="col-6 card reveal" style={{ '--i': 0 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="skeleton skeleton-title" style={{ width: '180px' }} />
+              <div className="skeleton skeleton-text medium" style={{ width: '220px' }} />
+            </div>
+            <span className="skeleton" style={{ width: '80px', height: '18px', borderRadius: '4px' }} />
+          </div>
+          <div style={{ margin: 'var(--space-xs) 0' }}>
+            <div className="skeleton skeleton-value" style={{ width: '200px', height: '36px' }} />
+            <div className="skeleton skeleton-text long" style={{ marginTop: '8px' }} />
+          </div>
+          <div className="confidence-bar" style={{ height: '8px', background: 'var(--color-rule-2)' }}>
+            <div className="skeleton" style={{ width: '100%', height: '100%' }} />
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', margin: 'var(--space-xs) 0 4px 0' }}>
+            <span className="skeleton skeleton-text short" />
+            <span className="skeleton skeleton-text" style={{ width: '120px' }} />
+          </div>
+          <div className="skeleton" style={{ width: '100%', height: '140px', borderRadius: 'var(--radius-card)' }} />
+        </div>
+
+        {/* Right Column */}
+        <div className="col-6 card reveal" style={{ '--i': 1 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="skeleton skeleton-title" style={{ width: '160px' }} />
+              <div className="skeleton skeleton-text medium" style={{ width: '200px' }} />
+            </div>
+            <span className="skeleton" style={{ width: '80px', height: '18px', borderRadius: '4px' }} />
+          </div>
+          <div style={{ margin: 'var(--space-xs) 0' }}>
+            <div className="skeleton skeleton-value" style={{ width: '160px', height: '36px' }} />
+            <div className="skeleton skeleton-text long" style={{ marginTop: '8px' }} />
+          </div>
+          <div className="skeleton" style={{ width: '100%', height: '110px', borderRadius: 'var(--radius-card)', marginBottom: 'var(--space-xs)' }} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2xs)' }}>
+            {[0, 1, 2].map((j) => (
+              <div key={j} style={{ display: 'flex', justifyContent: 'space-between', paddingBottom: '4px', borderBottom: '1px solid var(--color-rule-2)' }}>
+                <span className="skeleton skeleton-text short" />
+                <span className="skeleton skeleton-text" style={{ width: '60px' }} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function RiskPageSkeleton() {
+  return (
+    <div className="page-body">
+      {[0, 1, 2].map((cardIdx) => (
+        <div key={cardIdx} className="card reveal" style={{ '--i': cardIdx } as any}>
+          <div className="card-header">
+            <div>
+              <div className="skeleton skeleton-title" style={{ width: '180px' }} />
+              <div className="skeleton skeleton-text medium" style={{ width: '220px' }} />
+            </div>
+          </div>
+          <table className="data-table">
+            <thead>
+              <tr>
+                {cardIdx === 0 && (
+                  <>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                  </>
+                )}
+                {cardIdx === 1 && (
+                  <>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                  </>
+                )}
+                {cardIdx === 2 && (
+                  <>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                    <th><span className="skeleton skeleton-text short" /></th>
+                  </>
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {[0, 1, 2].map((rowIdx) => (
+                <tr key={rowIdx}>
+                  <td><span className="skeleton skeleton-text medium" /></td>
+                  <td><span className="skeleton skeleton-text short" style={{ height: '14px', borderRadius: '3px' }} /></td>
+                  <td><span className="skeleton skeleton-text short" style={{ height: '14px', borderRadius: '3px' }} /></td>
+                  <td><span className="skeleton skeleton-text short" /></td>
+                  <td><span className="skeleton skeleton-text long" /></td>
+                  {cardIdx === 2 && <td><span className="skeleton skeleton-text short" /></td>}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function AgentsPageSkeleton() {
+  return (
+    <div className="agent-grid">
+      {[0, 1, 2, 3, 4, 5].map((i) => (
+        <div className="agent-card reveal" key={i} style={{ '--i': i } as any}>
+          <div className="agent-header">
+            <div className="skeleton skeleton-circle" style={{ width: '32px', height: '32px', flexShrink: 0 }} />
+            <div style={{ flex: 1, marginLeft: '8px' }}>
+              <span className="skeleton skeleton-text medium" style={{ height: '14px' }} />
+              <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }}>
+                <span className="skeleton" style={{ width: '40px', height: '14px', borderRadius: '3px' }} />
+                <span className="skeleton" style={{ width: '80px', height: '14px', borderRadius: '3px' }} />
               </div>
             </div>
           </div>
-        )}
+          <div style={{ margin: 'var(--space-xs) 0' }}>
+            <span className="skeleton skeleton-text long" />
+            <span className="skeleton skeleton-text medium" style={{ marginTop: '4px' }} />
+            <span className="skeleton skeleton-text long" style={{ marginTop: '4px' }} />
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+            <span className="skeleton skeleton-text long" style={{ height: '24px', borderRadius: '4px' }} />
+            <span className="skeleton skeleton-text long" style={{ height: '24px', borderRadius: '4px' }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
 
-        {/* 1. Dashboard View */}
-        {currentPage === 'dashboard' && metrics && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-lg)' }}>
-            {/* Bento Grid KPIs */}
-            <div className="bento-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
-              <div className="card glass-panel">
-                <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>Total Revenue</span>
-                <h3 style={{ fontSize: 'var(--text-xl)', margin: 'var(--space-2xs) 0' }}>${metrics.total_revenue.toLocaleString()}</h3>
-                <span style={{ color: 'var(--color-success)', fontSize: 'var(--text-xs)' }}>+5.2% from forecast</span>
-              </div>
-              <div className="card glass-panel">
-                <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>Net Working Capital</span>
-                <h3 style={{ fontSize: 'var(--text-xl)', margin: 'var(--space-2xs) 0' }}>${metrics.net_working_capital.toLocaleString()}</h3>
-                <span style={{ color: 'var(--color-muted)', fontSize: 'var(--text-xs)' }}>AR vs AP balances</span>
-              </div>
-              <div className="card glass-panel">
-                <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>Accounts Receivable</span>
-                <h3 style={{ fontSize: 'var(--text-xl)', margin: 'var(--space-2xs) 0' }}>${metrics.accounts_receivable.toLocaleString()}</h3>
-                <span style={{ color: 'var(--color-warning)', fontSize: 'var(--text-xs)' }}>1 Outstanding Invoice</span>
-              </div>
-              <div className="card glass-panel">
-                <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>Accounts Payable</span>
-                <h3 style={{ fontSize: 'var(--text-xl)', margin: 'var(--space-2xs) 0' }}>${metrics.accounts_payable.toLocaleString()}</h3>
-                <span style={{ color: 'var(--color-muted)', fontSize: 'var(--text-xs)' }}>1 Upcoming Bill</span>
-              </div>
-            </div>
-
-            {/* Split Panel: Alerts & Timeline */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-lg)' }}>
-              <div className="card">
-                <h3>Active Operational Alerts</h3>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)' }}>
-                  {alerts.map((alert, i) => (
-                    <div key={i} style={{
-                      padding: 'var(--space-xs)',
-                      background: alert.severity === 'CRITICAL' ? 'var(--color-error-dim)' : 'var(--color-warning-dim)',
-                      color: alert.severity === 'CRITICAL' ? 'var(--color-error)' : 'var(--color-warning)',
-                      border: '1px solid currentColor',
-                      borderRadius: '4px'
-                    }}>
-                      <div style={{ fontWeight: '600' }}>{alert.title}</div>
-                      <div style={{ fontSize: 'var(--text-sm)', opacity: 0.9 }}>{alert.message}</div>
-                    </div>
-                  ))}
+function BriefPageSkeleton() {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
+      <div className="card reveal">
+        <div className="skeleton skeleton-title" style={{ width: '200px' }} />
+        <div style={{ margin: '8px 0' }}>
+          <span className="skeleton skeleton-text long" />
+          <span className="skeleton skeleton-text long" style={{ marginTop: '4px' }} />
+          <span className="skeleton skeleton-text medium" style={{ marginTop: '4px' }} />
+        </div>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 'var(--space-sm)' }}>
+        {[0, 1, 2].map((i) => (
+          <div className="card reveal" key={i} style={{ borderLeft: '3px solid var(--color-rule-2)' }}>
+            <div className="skeleton skeleton-title" style={{ width: '120px' }} />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: 'var(--space-xs)' }}>
+              {[0, 1, 2].map((j) => (
+                <div key={j} style={{ padding: '8px 12px', background: 'var(--color-paper-3)', borderRadius: 'var(--radius-card)', height: '36px', display: 'flex', alignItems: 'center' }}>
+                  <span className="skeleton skeleton-text long" />
                 </div>
-              </div>
-
-              <div className="card">
-                <h3>Business Memory timeline</h3>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)' }}>
-                  {timeline.map((event) => (
-                    <div key={event.id} style={{ display: 'flex', justifyContent: 'space-between', paddingBottom: 'var(--space-2xs)', borderBottom: '1px solid var(--color-rule-2)' }}>
-                      <div>
-                        <span style={{ fontWeight: '500', fontSize: 'var(--text-sm)' }}>{event.description}</span>
-                        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>Source: {event.event_type}</div>
-                      </div>
-                      <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>
-                        {new Date(event.timestamp).toLocaleTimeString()}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
+              ))}
             </div>
           </div>
-        )}
+        ))}
+      </div>
+      <div className="card reveal">
+        <div className="skeleton skeleton-title" style={{ width: '140px' }} />
+        <span className="skeleton skeleton-text long" />
+      </div>
+    </div>
+  )
+}
 
-        {/* 2. Forecasts View */}
-        {currentPage === 'forecast' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-lg)' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-lg)' }}>
-              {revForecast && (
-                <div className="card">
-                  <h3>Revenue Projection (90-Day)</h3>
-                  <p>{revForecast.prediction}</p>
-                  <div style={{ background: 'var(--color-paper-2)', padding: 'var(--space-sm)', borderRadius: '6px' }}>
-                    <div style={{ fontSize: 'var(--text-sm)' }}><strong>Confidence Score:</strong> {revForecast.confidence_score * 100}%</div>
-                    <div style={{ fontSize: 'var(--text-sm)' }}><strong>Feature Weights:</strong> {revForecast.important_features.join(', ')}</div>
-                    <div style={{ fontSize: 'var(--text-sm)' }}><strong>Suggested Action:</strong> {revForecast.suggested_action}</div>
-                  </div>
-                </div>
-              )}
+function HistoryPageSkeleton() {
+  return (
+    <div className="card reveal" style={{ marginTop: 'var(--space-md)' }}>
+      <div className="card-header">
+        <div>
+          <div className="skeleton skeleton-title" style={{ width: '220px' }} />
+          <div className="skeleton skeleton-text medium" style={{ width: '300px' }} />
+        </div>
+      </div>
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th><span className="skeleton skeleton-text short" /></th>
+            <th><span className="skeleton skeleton-text short" /></th>
+            <th><span className="skeleton skeleton-text short" /></th>
+            <th><span className="skeleton skeleton-text short" /></th>
+            <th><span className="skeleton skeleton-text short" /></th>
+          </tr>
+        </thead>
+        <tbody>
+          {[0, 1, 2, 3, 4].map((i) => (
+            <tr key={i}>
+              <td><span className="skeleton skeleton-text medium" /></td>
+              <td><span className="skeleton skeleton-text long" /></td>
+              <td><span className="skeleton skeleton-text short" /></td>
+              <td><span className="skeleton skeleton-text short" /></td>
+              <td><span className="skeleton skeleton-text medium" /></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
 
-              {cashForecast && (
-                <div className="card">
-                  <h3>Cash Flow Forecast (30-Day)</h3>
-                  <p>{cashForecast.prediction}</p>
-                  <div style={{ background: 'var(--color-paper-2)', padding: 'var(--space-sm)', borderRadius: '6px' }}>
-                    <div style={{ fontSize: 'var(--text-sm)' }}><strong>Confidence Score:</strong> {cashForecast.confidence_score * 100}%</div>
-                    <div style={{ fontSize: 'var(--text-sm)' }}><strong>Business Impact:</strong> {cashForecast.business_impact}</div>
-                    <div style={{ fontSize: 'var(--text-sm)' }}><strong>Suggested Action:</strong> {cashForecast.suggested_action}</div>
-                  </div>
-                </div>
-              )}
-            </div>
+// ─── Dashboard Page (Bento Grid) ─────────────────────────────
+function DashboardPage() {
+  const [metrics, setMetrics] = useState<any>(null)
+  const [health, setHealth] = useState<any>(null)
+  const [alerts, setAlerts] = useState<any[]>([])
+  const [timeline, setTimeline] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
 
-            <div className="card">
-              <h3>Demand forecasting</h3>
-              <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 'var(--space-sm)' }}>
-                <thead>
-                  <tr style={{ borderBottom: '2px solid var(--color-rule)' }}>
-                    <th style={{ textAlign: 'left', padding: '8px' }}>Product</th>
-                    <th style={{ textAlign: 'left', padding: '8px' }}>SKU</th>
-                    <th style={{ textAlign: 'left', padding: '8px' }}>Prediction</th>
-                    <th style={{ textAlign: 'left', padding: '8px' }}>Suggested Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {demandForecast.map((item, i) => (
-                    <tr key={i} style={{ borderBottom: '1px solid var(--color-rule-2)' }}>
-                      <td style={{ padding: '8px' }}>{item.name}</td>
-                      <td style={{ padding: '8px' }}>{item.sku}</td>
-                      <td style={{ padding: '8px' }}>{item.prediction}</td>
-                      <td style={{ padding: '8px' }}>{item.suggested_action}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+  useEffect(() => {
+    Promise.all([getDashboard(), getHealth(), getAlerts(), getTimeline()])
+      .then(([d, h, a, t]) => {
+        setMetrics(d.data.metrics)
+        setHealth(h.data)
+        setAlerts(a.data)
+        setTimeline(t.data)
+      })
+      .finally(() => setLoading(false))
+  }, [])
 
-            {inventoryForecast.length > 0 && (
-              <div className="card">
-                <h3>Inventory & Stockout Forecasting</h3>
-                <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 'var(--space-sm)' }}>
-                  <thead>
-                    <tr style={{ borderBottom: '2px solid var(--color-rule)' }}>
-                      <th style={{ textAlign: 'left', padding: '8px' }}>Product</th>
-                      <th style={{ textAlign: 'left', padding: '8px' }}>SKU</th>
-                      <th style={{ textAlign: 'left', padding: '8px' }}>Prediction Indicators</th>
-                      <th style={{ textAlign: 'left', padding: '8px' }}>Suggested Action</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {inventoryForecast.map((item, i) => (
-                      <tr key={i} style={{ borderBottom: '1px solid var(--color-rule-2)' }}>
-                        <td style={{ padding: '8px' }}>{item.name}</td>
-                        <td style={{ padding: '8px' }}>{item.sku}</td>
-                        <td style={{ padding: '8px' }}>{item.prediction}</td>
-                        <td style={{ padding: '8px' }}>{item.suggested_action}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+  if (loading) return <DashboardPageSkeleton />
+
+  const score = health?.health_score ?? 0
+  const radius = 44; const circ = 2 * Math.PI * radius
+  const offset = circ - (score / 100) * circ
+  const ringColor = score >= 75 ? 'var(--color-success)' : score >= 50 ? 'var(--color-warning)' : 'var(--color-error)'
+
+  return (
+    <div className="page-body">
+      <div className="bento-grid">
+        {/* Row 1: KPI Metrics */}
+        <div className="col-3 metric-tile reveal" style={{ '--i': 0, '--tile-accent': 'var(--color-success)', '--tile-icon-bg': 'oklch(68% 0.16 145 / 0.08)' } as any}>
+          <div className="metric-tile-header">
+            <span className="metric-label">Total Revenue</span>
+            <div className="metric-icon"><DollarSign size={14} style={{ color: 'var(--color-success)' }} /></div>
           </div>
-        )}
-
-        {/* 3. Risk Models View */}
-        {currentPage === 'risk' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-lg)' }}>
-            <div className="card">
-              <h3>Customer Churn & Payment Volatility</h3>
-              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                <thead>
-                  <tr style={{ borderBottom: '2px solid var(--color-rule)' }}>
-                    <th style={{ textAlign: 'left', padding: '8px' }}>Customer</th>
-                    <th style={{ textAlign: 'left', padding: '8px' }}>Late Payment Risk</th>
-                    <th style={{ textAlign: 'left', padding: '8px' }}>Action Plan</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {custRisks.map((c, i) => (
-                    <tr key={i} style={{ borderBottom: '1px solid var(--color-rule-2)' }}>
-                      <td style={{ padding: '8px' }}>{c.name}</td>
-                      <td style={{ padding: '8px' }}>{c.prediction}</td>
-                      <td style={{ padding: '8px' }}>{c.suggested_action}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+          <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between' }}>
+            <div className="metric-value">
+              <NumberTicker value={metrics?.total_revenue ?? 0} formatFn={fmt} />
             </div>
-
-            <div className="card">
-              <h3>Supplier Delivery delays</h3>
-              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                <thead>
-                  <tr style={{ borderBottom: '2px solid var(--color-rule)' }}>
-                    <th style={{ textAlign: 'left', padding: '8px' }}>Supplier</th>
-                    <th style={{ textAlign: 'left', padding: '8px' }}>Delay Risk</th>
-                    <th style={{ textAlign: 'left', padding: '8px' }}>Mitigation Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {suppRisks.map((s, i) => (
-                    <tr key={i} style={{ borderBottom: '1px solid var(--color-rule-2)' }}>
-                      <td style={{ padding: '8px' }}>{s.name}</td>
-                      <td style={{ padding: '8px' }}>{s.prediction}</td>
-                      <td style={{ padding: '8px' }}>{s.suggested_action}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            {pricingRecs.length > 0 && (
-              <div className="card">
-                <h3>Optimal Margin Pricing Recommendations</h3>
-                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                  <thead>
-                    <tr style={{ borderBottom: '2px solid var(--color-rule)' }}>
-                      <th style={{ textAlign: 'left', padding: '8px' }}>Product</th>
-                      <th style={{ textAlign: 'left', padding: '8px' }}>SKU</th>
-                      <th style={{ textAlign: 'left', padding: '8px' }}>Recommended Adjustments</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {pricingRecs.map((p, i) => (
-                      <tr key={i} style={{ borderBottom: '1px solid var(--color-rule-2)' }}>
-                        <td style={{ padding: '8px' }}>{p.name}</td>
-                        <td style={{ padding: '8px' }}>{p.sku}</td>
-                        <td style={{ padding: '8px' }}>{p.prediction}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+            <Sparkline data={[12000, 15000, 18200, 16400, 21800, 24100, metrics?.total_revenue ?? 28000]} color="var(--color-success)" />
           </div>
-        )}
+        </div>
 
-        {/* 4. Agents & Recommendations View */}
-        {currentPage === 'agents' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-lg)' }}>
-            <div className="card">
-              <h3>CEO Strategic Recommendations Consensus</h3>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)', marginTop: 'var(--space-sm)' }}>
-                {recommendations.map(rec => (
-                  <div key={rec.id} style={{ border: '1px solid var(--color-rule)', borderRadius: 'var(--radius-card)', padding: 'var(--space-md)' }}>
-                    <div className="flex-between">
-                      <span style={{ fontWeight: '600', textTransform: 'uppercase', fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>
-                        {rec.agent_name} Report
-                      </span>
-                      <span style={{
-                        padding: '2px 8px',
-                        borderRadius: '4px',
-                        fontSize: 'var(--text-xs)',
-                        background: rec.risk === 'CRITICAL' ? 'var(--color-error-dim)' : 'var(--color-warning-dim)',
-                        color: rec.risk === 'CRITICAL' ? 'var(--color-error)' : 'var(--color-warning)'
-                      }}>{rec.risk} RISK</span>
-                    </div>
-                    
-                    <h4 style={{ margin: 'var(--space-2xs) 0' }}>{rec.action}</h4>
-                    <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-ink-2)' }}>{rec.reasoning}</p>
-                    
-                    <div className="flex-between" style={{ marginTop: 'var(--space-sm)' }}>
-                      <button className="btn-secondary" onClick={() => handleExplain(rec.id)}>Audit Evidence</button>
-                      <div className="flex-center" style={{ gap: 'var(--space-xs)' }}>
-                        <button className="btn-secondary" onClick={() => handleDecision(rec.id, 'Decline')} style={{ color: 'var(--color-error)' }}>Decline</button>
-                        <button className="btn-primary" onClick={() => handleDecision(rec.id, 'Approve')}>Approve</button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {agentReports.length > 0 && (
-              <div className="card">
-                <h3>Specialist Agent Real-Time Diagnostics</h3>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 'var(--space-md)', marginTop: 'var(--space-sm)' }}>
-                  {agentReports.map((rep, idx) => (
-                    <div key={idx} className="card glass-panel" style={{ padding: 'var(--space-sm)' }}>
-                      <strong>{rep.agent_name}</strong>
-                      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)', marginTop: '4px' }}>{rep.role}</div>
-                      <div style={{ fontSize: 'var(--text-sm)', marginTop: '8px', color: 'var(--color-ink)' }}>{rep.analysis}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {explanation && (
-              <div className="card glass-panel" style={{ border: '1px solid var(--color-success)' }}>
-                <h3>Auditable Explainability Log</h3>
-                <p><strong>Evidentiary Details:</strong> {explanation.evidence}</p>
-                <p><strong>Business Impact:</strong> {explanation.business_impact}</p>
-                <p><strong>Affected Departments:</strong> {explanation.affected_departments.join(', ')}</p>
-                <button className="btn-secondary" onClick={() => setExplanation(null)}>Close Audit File</button>
-              </div>
-            )}
+        <div className="col-3 metric-tile reveal" style={{ '--i': 1, '--tile-accent': 'var(--color-accent)', '--tile-icon-bg': 'oklch(60% 0.18 250 / 0.08)' } as any}>
+          <div className="metric-tile-header">
+            <span className="metric-label">Net Working Capital</span>
+            <div className="metric-icon"><Activity size={14} style={{ color: 'var(--color-accent)' }} /></div>
           </div>
-        )}
+          <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between' }}>
+            <div className="metric-value">
+              <NumberTicker value={metrics?.net_working_capital ?? 0} formatFn={fmt} />
+            </div>
+            <Sparkline data={[15000, 16100, 15300, 16900, 16100, metrics?.net_working_capital ?? 18000]} color="var(--color-accent)" />
+          </div>
+        </div>
 
-        {/* 5. Digital Twin Simulation View */}
-        {currentPage === 'simulate' && (
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-lg)' }}>
-            <div className="card">
-              <h3>What-If Simulation Inputs</h3>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)', marginTop: 'var(--space-sm)' }}>
-                <div>
-                  <label style={{ display: 'block', fontSize: 'var(--text-sm)', marginBottom: '4px' }}>Price Adjustments: {priceChange}%</label>
-                  <input type="range" min="-30" max="30" step="1" value={priceChange} onChange={e => setPriceChange(parseFloat(e.target.value))} style={{ width: '100%' }} />
-                </div>
+        <div className="col-3 metric-tile reveal" style={{ '--i': 2, '--tile-accent': 'var(--color-info)', '--tile-icon-bg': 'oklch(66% 0.16 195 / 0.08)' } as any}>
+          <div className="metric-tile-header">
+            <span className="metric-label">Receivables (AR)</span>
+            <div className="metric-icon"><ArrowUpRight size={14} style={{ color: 'var(--color-info)' }} /></div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between' }}>
+            <div className="metric-value">
+              <NumberTicker value={metrics?.accounts_receivable ?? 0} formatFn={fmt} />
+            </div>
+            <Sparkline data={[8200, 11400, 10200, 12600, 9700, metrics?.accounts_receivable ?? 11000]} color="var(--color-info)" />
+          </div>
+        </div>
 
-                <div>
-                  <label style={{ display: 'block', fontSize: 'var(--text-sm)', marginBottom: '4px' }}>Hiring Budget: ${hiringCost.toLocaleString()}</label>
-                  <input type="range" min="0" max="50000" step="1000" value={hiringCost} onChange={e => setHiringCost(parseFloat(e.target.value))} style={{ width: '100%' }} />
-                </div>
+        <div className="col-3 metric-tile reveal" style={{ '--i': 3, '--tile-accent': 'var(--color-warning)', '--tile-icon-bg': 'oklch(72% 0.15 75 / 0.08)' } as any}>
+          <div className="metric-tile-header">
+            <span className="metric-label">Active Customers</span>
+            <div className="metric-icon"><Users size={14} style={{ color: 'var(--color-warning)' }} /></div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between' }}>
+            <div className="metric-value">
+              <NumberTicker value={metrics?.active_customers ?? 0} />
+            </div>
+            <Sparkline data={[24, 26, 26, 29, 31, metrics?.active_customers ?? 34]} color="var(--color-warning)" />
+          </div>
+        </div>
 
-                <div>
-                  <label style={{ display: 'block', fontSize: 'var(--text-sm)', marginBottom: '4px' }}>Supplier Protocol</label>
-                  <select value={supplierChange} onChange={e => setSupplierChange(e.target.value)} style={{ width: '100%' }}>
-                    <option value="standard">Maintain standard supplier relations</option>
-                    <option value="diversify">Diversify suppliers (reduces concentration risk)</option>
-                    <option value="cheaper_alternative">Partner with cheaper alternative supplier</option>
-                  </select>
-                </div>
+        {/* Row 2: Business Health Console (Left) & Active Alerts (Right) */}
+        <div className="col-6 row-2 card reveal" style={{ '--i': 4 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">Business Health telemetry</div>
+              <div className="card-subtitle">Composite operational score matrix</div>
+            </div>
+            <span className="badge" style={{
+              background: score >= 75 ? 'oklch(68% 0.16 145 / 0.08)' : score >= 50 ? 'oklch(72% 0.15 75 / 0.08)' : 'oklch(62% 0.18 25 / 0.08)',
+              color: ringColor,
+              borderColor: ringColor
+            }}>{health?.status}</span>
+          </div>
 
-                <div>
-                  <label style={{ display: 'block', fontSize: 'var(--text-sm)', marginBottom: '4px' }}>Inventory Strategy</label>
-                  <select value={inventoryDecision} onChange={e => setInventoryDecision(e.target.value)} style={{ width: '100%' }}>
-                    <option value="standard">Standard inventory reorder levels</option>
-                    <option value="bulk_buy">Bulk Buy (requires cash, lowers cost margin)</option>
-                    <option value="just_in_time">Just-In-Time replenishment</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label style={{ display: 'block', fontSize: 'var(--text-sm)', marginBottom: '4px' }}>Corporate Loan</label>
-                  <select value={loanDecision} onChange={e => setLoanDecision(e.target.value)} style={{ width: '100%' }}>
-                    <option value="no_loan">No Loan</option>
-                    <option value="take_loan">Take $50,000 corporate liquidity loan</option>
-                  </select>
-                </div>
-
-                <button className="btn-primary" onClick={handleSimulate} disabled={simulating}>
-                  {simulating ? 'Calculating Twin Forecasts...' : 'Run Simulation'}
-                </button>
+          <div className="health-ring-wrap" style={{ margin: 'var(--space-xs) 0' }}>
+            <div className="health-ring">
+              <svg width="96" height="96" viewBox="0 0 100 100">
+                <circle cx="50" cy="50" r={radius} fill="none" stroke="var(--color-rule-2)" strokeWidth="6" />
+                <circle cx="50" cy="50" r={radius} fill="none" stroke={ringColor} strokeWidth="6"
+                  strokeDasharray={circ} strokeDashoffset={offset} strokeLinecap="round"
+                  style={{ transition: 'stroke-dashoffset 1.2s cubic-bezier(0.16, 1, 0.3, 1)' }} />
+              </svg>
+              <div className="health-ring-label">
+                <span className="health-ring-num" style={{ color: ringColor }}>
+                  <NumberTicker value={score} />
+                </span>
+                <span className="health-ring-txt">/100</span>
               </div>
             </div>
 
-            <div className="card">
-              <h3>Simulated Business Health Forecast</h3>
-              {simResult ? (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)', marginTop: 'var(--space-sm)' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid var(--color-rule-2)', paddingBottom: 'var(--space-2xs)' }}>
-                    <span>Projected Revenue</span>
-                    <strong style={{ fontSize: 'var(--text-md)' }}>${simResult.revenue.toLocaleString()}</strong>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid var(--color-rule-2)', paddingBottom: 'var(--space-2xs)' }}>
-                    <span>Projected Profit</span>
-                    <strong style={{ fontSize: 'var(--text-md)' }}>${simResult.profit.toLocaleString()}</strong>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid var(--color-rule-2)', paddingBottom: 'var(--space-2xs)' }}>
-                    <span>Cash Flow State</span>
-                    <strong style={{ color: simResult.cash_flow === 'Positive' ? 'var(--color-success)' : 'var(--color-error)' }}>{simResult.cash_flow}</strong>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid var(--color-rule-2)', paddingBottom: 'var(--space-2xs)' }}>
-                    <span>Calculated Enterprise Risk</span>
-                    <strong style={{ color: simResult.risk === 'LOW' ? 'var(--color-success)' : 'var(--color-warning)' }}>{simResult.risk}</strong>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid var(--color-rule-2)', paddingBottom: 'var(--space-2xs)' }}>
-                    <span>Warehouse Stocks</span>
-                    <strong>{simResult.inventory}</strong>
-                  </div>
-                  
-                  <div style={{ textAlign: 'center', marginTop: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--color-paper-2)', borderRadius: '8px' }}>
-                    <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-muted)' }}>Resulting Health Score</div>
-                    <div style={{ fontSize: 'var(--text-2xl)', fontWeight: '700', color: 'var(--color-accent)' }}>{simResult.business_health}/100</div>
-                  </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2xs)', flex: 1 }}>
+              {[
+                { label: 'Gross Margin', value: `${health?.gross_profit_margin_pct?.toFixed(1)}%` },
+                { label: 'Operating Ratio', value: health?.operating_ratio?.toFixed(3) },
+                { label: 'Overdue Invoices', value: health?.overdue_invoices },
+                { label: 'Low Stock SKUs', value: health?.low_stock_products },
+              ].map(r => (
+                <div key={r.label} style={{ display: 'flex', justifySelf: 'stretch', justifyContent: 'space-between', fontSize: 'var(--text-xs)', borderBottom: '1px solid var(--color-rule-2)', paddingBottom: '4px' }}>
+                  <span style={{ color: 'var(--color-ink-2)' }}>{r.label}</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--color-ink)' }}>{r.value ?? 0}</span>
                 </div>
-              ) : (
-                <div style={{ textAlign: 'center', color: 'var(--color-muted)', marginTop: 'var(--space-xl)' }}>
-                  Awaiting simulation execution... Adjust the sliders and run.
-                </div>
-              )}
+              ))}
             </div>
           </div>
-        )}
+        </div>
 
-        {/* 6. Gemma Chat View */}
-        {currentPage === 'chat' && (
-          <div className="card" style={{ display: 'flex', flexDirection: 'column', height: '80vh' }}>
-            <h3>Context-Aware Chat</h3>
-            <div style={{ flexGrow: 1, overflowY: 'auto', border: '1px solid var(--color-rule)', borderRadius: 'var(--radius-card)', padding: 'var(--space-md)', background: 'var(--color-paper-2)', marginBottom: 'var(--space-md)' }}>
-              {chatHistory.map((chat, i) => (
-                <div key={i} style={{
-                  marginBottom: 'var(--space-md)',
-                  textAlign: chat.sender === 'user' ? 'right' : 'left'
-                }}>
-                  <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>{chat.sender === 'user' ? 'You' : 'Gemma'}</span>
-                  <div style={{
-                    display: 'inline-block',
-                    maxWidth: '80%',
-                    padding: '8px 12px',
-                    borderRadius: '8px',
-                    background: chat.sender === 'user' ? 'var(--color-accent)' : 'var(--color-paper-3)',
-                    color: chat.sender === 'user' ? 'var(--color-accent-ink)' : 'var(--color-ink)',
-                    textAlign: 'left'
-                  }}>
-                    {chat.text}
+        <div className="col-6 row-2 card reveal" style={{ '--i': 5 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">Active Security & Risk Alerts</div>
+              <div className="card-subtitle">{alerts.length} operational issues flag telemetry</div>
+            </div>
+          </div>
+          {alerts.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon" style={{ color: 'var(--color-success)' }}><CheckCircle2 size={32} /></div>
+              <h3>System Secured</h3>
+              <p>No anomalous event vectors or risk actions flagged.</p>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2xs)', maxHeight: '280px', overflowY: 'auto', paddingRight: '4px' }}>
+              {alerts.map((a, i) => (
+                <div className="alert-item" key={i}>
+                  <span className={`alert-badge ${a.severity?.toLowerCase() === 'critical' ? 'critical' : 'warning'}`}>{a.severity}</span>
+                  <div className="alert-body">
+                    <div className="alert-title">{a.title || a.category}</div>
+                    <div className="alert-msg">{a.message}</div>
                   </div>
                 </div>
               ))}
-              {chatLoading && <div style={{ color: 'var(--color-muted)', fontSize: 'var(--text-xs)' }}>Gemma is searching business memory...</div>}
             </div>
+          )}
+        </div>
 
-            <form onSubmit={handleChat} style={{ display: 'flex', gap: 'var(--space-xs)' }}>
-              <input 
-                type="text" 
-                value={question} 
-                onChange={e => setQuestion(e.target.value)} 
-                placeholder="Ask about inventory, supplier delays, or GPM updates..." 
-                style={{ flexGrow: 1 }}
-              />
-              <button type="submit" className="btn-primary">Query</button>
-            </form>
-          </div>
-        )}
-
-        {/* 7. Document Ingestion View */}
-        {currentPage === 'upload' && (
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-lg)' }}>
-            <div className="card">
-              <h3>Ingest Business Documents</h3>
-              <form onSubmit={handleUpload} style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)', marginTop: 'var(--space-sm)' }}>
-                <div>
-                  <label style={{ display: 'block', fontSize: 'var(--text-sm)', marginBottom: '4px' }}>Document Classification</label>
-                  <select value={uploadType} onChange={e => setUploadType(e.target.value as any)} style={{ width: '100%' }}>
-                    <option value="invoice">Invoice / Bill</option>
-                    <option value="gst">GST tax report</option>
-                    <option value="bank">Bank Statement</option>
-                    <option value="excel">Excel sheet ledger</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label style={{ display: 'block', fontSize: 'var(--text-sm)', marginBottom: '4px' }}>Select File</label>
-                  <input type="file" onChange={e => setUploadFile(e.target.files ? e.target.files[0] : null)} style={{ width: '100%' }} />
-                </div>
-
-                <button type="submit" className="btn-primary">Process Document</button>
-              </form>
-              {uploadStatus && (
-                <div style={{ marginTop: 'var(--space-sm)', fontSize: 'var(--text-sm)', color: 'var(--color-success)' }}>
-                  {uploadStatus}
-                </div>
-              )}
-            </div>
-
-            <div className="card">
-              <h3>Extracted Entity Schema</h3>
-              {parsedMetadata ? (
-                <pre style={{
-                  background: 'var(--color-paper-2)',
-                  padding: 'var(--space-sm)',
-                  borderRadius: '6px',
-                  fontFamily: 'var(--font-mono)',
-                  fontSize: 'var(--text-xs)',
-                  overflowX: 'auto'
-                }}>
-                  {JSON.stringify(parsedMetadata, null, 2)}
-                </pre>
-              ) : (
-                <div style={{ textAlign: 'center', color: 'var(--color-muted)', marginTop: 'var(--space-xl)' }}>
-                  Metadata schema will render here after upload processing.
-                </div>
-              )}
+        {/* Row 3: Business Timeline (Left) & Secondary Metrics Grid (Right) */}
+        <div className="col-8 card reveal" style={{ '--i': 6 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">System Event Log</div>
+              <div className="card-subtitle">Real-time business operation audit timeline</div>
             </div>
           </div>
-        )}
+          {timeline.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon"><FileText size={32} /></div>
+              <h3>Log Clear</h3>
+              <p>Telemetry ledger is empty. Awaiting database transactions.</p>
+            </div>
+          ) : (
+            <div className="timeline" style={{ maxHeight: '240px', overflowY: 'auto', paddingRight: '4px' }}>
+              {timeline.slice(0, 10).map((ev, i) => (
+                <div className="timeline-item" key={i}>
+                  <div className="timeline-dot" style={{
+                    background: ev.severity === 'CRITICAL' ? 'var(--color-error)' : ev.severity === 'WARNING' ? 'var(--color-warning)' : 'var(--color-accent)'
+                  }} />
+                  <div className="timeline-content">
+                    <div className="timeline-event" style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span>{ev.event_type}</span>
+                      <span className="timeline-time">{new Date(ev.timestamp).toLocaleTimeString()}</span>
+                    </div>
+                    <div className="timeline-desc">{ev.description}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
 
-        {/* 8. Decision Logs View */}
-        {currentPage === 'history' && (
-          <div className="card">
-            <h3>Decision Audit Trail</h3>
-            <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 'var(--space-sm)' }}>
-              <thead>
-                <tr style={{ borderBottom: '2px solid var(--color-rule)' }}>
-                  <th style={{ textAlign: 'left', padding: '8px' }}>Timestamp</th>
-                  <th style={{ textAlign: 'left', padding: '8px' }}>Specialist Initiator</th>
-                  <th style={{ textAlign: 'left', padding: '8px' }}>Action Target</th>
-                  <th style={{ textAlign: 'left', padding: '8px' }}>User Response</th>
-                </tr>
-              </thead>
-              <tbody>
-                {decisionHistory.map((item, i) => (
-                  <tr key={i} style={{ borderBottom: '1px solid var(--color-rule-2)' }}>
-                    <td style={{ padding: '8px' }}>{new Date(item.timestamp).toLocaleString()}</td>
-                    <td style={{ padding: '8px' }}>{item.agent_name}</td>
-                    <td style={{ padding: '8px' }}>{item.recommendation_text}</td>
-                    <td style={{ padding: '8px', color: item.action_taken === 'Approve' ? 'var(--color-success)' : 'var(--color-error)' }}>
-                      {item.action_taken}
-                    </td>
-                  </tr>
-                ))}
-                {decisionHistory.length === 0 && (
-                  <tr>
-                    <td colSpan={4} style={{ textAlign: 'center', padding: '24px', color: 'var(--color-muted)' }}>
-                      No decisions have been logged yet. Approve a recommendation from the CEO Agent tab.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+        <div className="col-4 card reveal" style={{ '--i': 7 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">Secondary telemetry</div>
+              <div className="card-subtitle">Ancillary business variables</div>
+            </div>
           </div>
-        )}
-      </main>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-2xs)', height: '100%' }}>
+            {[
+              { label: 'Payables (AP)', value: metrics?.accounts_payable ?? 0, format: fmt, color: 'var(--color-error)' },
+              { label: 'Monthly Revenue', value: metrics?.monthly_revenue ?? 0, format: fmt, color: 'var(--color-success)' },
+              { label: 'Low Stock SKUs', value: metrics?.low_stock_alerts ?? 0, format: (v: number) => String(v), color: metrics?.low_stock_alerts > 0 ? 'var(--color-error)' : 'var(--color-ink-2)' },
+              { label: 'Monthly Orders', value: metrics?.monthly_orders ?? 0, format: (v: number) => String(v), color: 'var(--color-accent)' },
+            ].map(item => (
+              <div key={item.label} style={{ background: 'var(--color-paper-3)', padding: 'var(--space-2xs)', borderRadius: 'var(--radius-card)', border: '1px solid var(--color-rule-2)' }}>
+                <div style={{ fontSize: '0.62rem', fontFamily: 'var(--font-mono)', color: 'var(--color-muted)', textTransform: 'uppercase', marginBottom: '2px' }}>{item.label}</div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-md)', fontWeight: 600, color: item.color }}>
+                  <NumberTicker value={item.value} formatFn={item.format} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
     </div>
-  );
+  )
 }
 
-export default App;
+// ─── Forecast Page (Workbench Structure with SVG Chart) ──────
+function ForecastPage() {
+  const [revenue, setRevenue] = useState<any>(null)
+  const [cashflow, setCashflow] = useState<any>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    Promise.all([getRevenueForecast(), getCashflowForecast()])
+      .then(([r, c]) => { setRevenue(r.data); setCashflow(c.data) })
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) return <ForecastPageSkeleton />
+
+  return (
+    <div className="page-body">
+      <div className="bento-grid">
+        {/* Left Column: Revenue Projection Workbench */}
+        <div className="col-6 card reveal" style={{ '--i': 0 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">90-Day Revenue Forecasting Model</div>
+              <div className="card-subtitle">Statistical model based on historical aggregates</div>
+            </div>
+            <span className="badge blue">Confidence: {pct(revenue?.confidence_score ?? 0)}</span>
+          </div>
+
+          <div style={{ margin: 'var(--space-3xs) 0' }}>
+            <div className="forecast-value" style={{ color: 'var(--color-success)' }}>
+              {revenue?.metadata?.forecasted_value ? (
+                <NumberTicker value={revenue.metadata.forecasted_value} formatFn={fmt} />
+              ) : '—'}
+            </div>
+            <div className="forecast-label">Projected gross incoming transactions (90d)</div>
+          </div>
+
+          <div className="confidence-bar">
+            <div className="confidence-fill" style={{ width: `${(revenue?.confidence_score ?? 0) * 100}%` }} />
+          </div>
+
+          <div style={{ display: 'flex', justifySelf: 'stretch', justifyContent: 'space-between', fontSize: '0.68rem', fontFamily: 'var(--font-mono)', color: 'var(--color-muted)', borderBottom: '1px solid var(--color-rule-2)', paddingBottom: '4px' }}>
+            <span>DATA SAMPLE MATRIX</span>
+            <span>{revenue?.metadata?.data_points ?? 0} NODES DETECTED</span>
+          </div>
+
+          {revenue?.metadata?.forecasted_value && (
+            <TelemetryChart baseValue={revenue.metadata.forecasted_value} confidence={revenue?.confidence_score ?? 0} color="var(--color-success)" secondaryColor="var(--color-success-dim)" days={90} />
+          )}
+
+          <div style={{ padding: 'var(--space-xs)', background: 'var(--color-paper-3)', borderLeft: '3px solid var(--color-accent)', borderRadius: 'var(--radius-card)', fontSize: 'var(--text-xs)', color: 'var(--color-ink-2)', lineHeight: 1.5, marginTop: 'var(--space-2xs)' }}>
+            <div style={{ fontWeight: 600, color: 'var(--color-ink)', marginBottom: '4px', fontFamily: 'var(--font-display)' }}>Decision Suggestion:</div>
+            {revenue?.suggested_action}
+          </div>
+        </div>
+
+        {/* Right Column: Cash Flow Telemetry */}
+        <div className="col-6 card reveal" style={{ '--i': 1 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">30-Day Liquidity & Cash Flow Forecast</div>
+              <div className="card-subtitle">Deterministic short-term capital ledger</div>
+            </div>
+            <span className={`badge ${cashflow?.metadata?.net_balance >= 0 ? 'green' : 'red'}`}>
+              Risk: {cashflow?.metadata?.risk_level ?? 'UNKNOWN'}
+            </span>
+          </div>
+
+          <div style={{ margin: 'var(--space-3xs) 0' }}>
+            <div className="forecast-value" style={{ color: cashflow?.metadata?.net_balance >= 0 ? 'var(--color-success)' : 'var(--color-error)' }}>
+              {cashflow?.metadata?.net_balance !== undefined ? (
+                <NumberTicker value={cashflow.metadata.net_balance} formatFn={fmt} />
+              ) : '—'}
+            </div>
+            <div className="forecast-label">Net Balance Position (30d)</div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-2xs)', marginTop: 'var(--space-2xs)' }}>
+            {[
+              { label: 'Receivables (AR)', value: cashflow?.metadata?.total_ar ?? 0, color: 'var(--color-success)' },
+              { label: 'Payables (AP)', value: cashflow?.metadata?.total_ap ?? 0, color: 'var(--color-error)' },
+              { label: 'Liquidity Ratio', value: cashflow?.metadata?.liquidity_ratio ?? 0, color: 'var(--color-accent)' },
+              { label: 'Cash Health Level', value: cashflow?.metadata?.risk_level ?? '—', color: 'var(--color-warning)' },
+            ].map(r => (
+              <div key={r.label} style={{ background: 'var(--color-paper-3)', borderRadius: 'var(--radius-card)', padding: 'var(--space-2xs) var(--space-xs)', border: '1px solid var(--color-rule-2)' }}>
+                <div style={{ fontSize: '0.62rem', fontFamily: 'var(--font-mono)', color: 'var(--color-muted)', textTransform: 'uppercase', marginBottom: '2px' }}>{r.label}</div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-sm)', fontWeight: 700, color: r.color }}>
+                  {typeof r.value === 'number' ? (
+                    <NumberTicker value={r.value} formatFn={r.label.includes('Ratio') ? (v) => v.toFixed(2) : fmt} />
+                  ) : r.value}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {cashflow?.metadata?.net_balance !== undefined && (
+            <TelemetryChart baseValue={Math.abs(cashflow.metadata.net_balance)} confidence={0.82} color="var(--color-accent)" secondaryColor="var(--color-accent-dim)" days={30} />
+          )}
+        </div>
+
+        {/* Section 2: Executive Impact Matrices */}
+        <div className="col-12 card reveal" style={{ '--i': 2 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">Strategic Insights & Decision Matrix</div>
+              <div className="card-subtitle">AI synthesis of forecasted outcomes</div>
+            </div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-sm)' }}>
+            {[
+              { title: 'Revenue Vector Impact', data: revenue, border: 'var(--color-success)' },
+              { title: 'Liquidity Ledger Impact', data: cashflow, border: 'var(--color-info)' }
+            ].map((f, i) => (
+              <div key={i} style={{ padding: 'var(--space-sm)', background: 'var(--color-paper-3)', borderRadius: 'var(--radius-card)', border: '1px solid var(--color-rule)', borderLeft: `4px solid ${f.border}` }}>
+                <div style={{ fontSize: 'var(--text-sm)', fontWeight: 700, color: 'var(--color-ink)', marginBottom: 'var(--space-2xs)', fontFamily: 'var(--font-display)' }}>{f.title}</div>
+                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-ink-2)', lineHeight: 1.6, marginBottom: 'var(--space-2xs)' }}>{f.data?.business_impact}</div>
+                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-accent)', fontWeight: 600, fontFamily: 'var(--font-mono)' }}>→ {f.data?.suggested_action}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Risk Page (Tabular Console) ──────────────────────────────
+function RiskPage() {
+  const [customers, setCustomers] = useState<any[]>([])
+  const [suppliers, setSuppliers] = useState<any[]>([])
+  const [pricing, setPricing] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    Promise.all([getCustomerRisk(), getSupplierRisk(), getPricing()])
+      .then(([c, s, p]) => { setCustomers(c.data); setSuppliers(s.data); setPricing(p.data) })
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) return <RiskPageSkeleton />
+
+  const riskBadge = (r: string) => {
+    const norm = r?.toUpperCase()
+    const label = norm === 'CRITICAL' || norm === 'HIGH' ? 'red' : norm === 'MEDIUM' || norm === 'AMBER' ? 'amber' : 'green'
+    return <span className={`badge ${label}`}>{r}</span>
+  }
+
+  return (
+    <div className="page-body">
+      {/* Customer Risk Registry */}
+      <div className="card reveal" style={{ '--i': 0 } as any}>
+        <div className="card-header">
+          <div>
+            <div className="card-title">Customer Portfolio Risk Telemetry</div>
+            <div className="card-subtitle">{customers.length} ledger instances analyzed</div>
+          </div>
+        </div>
+        {customers.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-icon"><Users size={32} /></div>
+            <h3>No Customer Nodes</h3>
+            <p>Database table is empty. Register customers to initiate matrix.</p>
+          </div>
+        ) : (
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Customer Node</th>
+                <th>Churn Risk Index</th>
+                <th>Receivables Risk</th>
+                <th>Lifetime Capital (CLV)</th>
+                <th>Automated Action Recommendation</th>
+              </tr>
+            </thead>
+            <tbody>
+              {customers.map((c, i) => (
+                <tr key={i}>
+                  <td style={{ fontWeight: 600, color: 'var(--color-ink)' }}>{c.name}</td>
+                  <td style={{ fontFamily: 'var(--font-mono)' }}>
+                    {riskBadge(c.churn_probability > 0.5 ? 'HIGH' : c.churn_probability > 0.25 ? 'MEDIUM' : 'LOW')}
+                    <span style={{ marginLeft: '8px', color: 'var(--color-muted)' }}>{pct(c.churn_probability)}</span>
+                  </td>
+                  <td>{riskBadge(c.late_payment_risk)}</td>
+                  <td style={{ color: 'var(--color-success)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{fmt(c.clv ?? 0)}</td>
+                  <td style={{ fontSize: '0.72rem', color: 'var(--color-ink-2)', maxWidth: '300px' }}>{c.suggested_action}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Supplier Reliability Registry */}
+      <div className="card reveal" style={{ '--i': 1 } as any}>
+        <div className="card-header">
+          <div>
+            <div className="card-title">Supplier Vector Risk Registry</div>
+            <div className="card-subtitle">{suppliers.length} node pipelines monitored</div>
+          </div>
+        </div>
+        {suppliers.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-icon"><Truck size={32} /></div>
+            <h3>No Supplier Nodes</h3>
+            <p>Pipelines empty. Register suppliers to initiate monitoring.</p>
+          </div>
+        ) : (
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Supplier Node</th>
+                <th>Delivery Risk Index</th>
+                <th>Telemetry Reliability</th>
+                <th>Mean Lead Duration</th>
+                <th>Market Price Risk</th>
+              </tr>
+            </thead>
+            <tbody>
+              {suppliers.map((s, i) => (
+                <tr key={i}>
+                  <td style={{ fontWeight: 600, color: 'var(--color-ink)' }}>{s.name}</td>
+                  <td>{riskBadge(s.delay_risk)}</td>
+                  <td>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <div style={{ flex: 1, height: '4px', background: 'var(--color-rule-2)', borderRadius: '99px', overflow: 'hidden' }}>
+                        <div style={{
+                          width: `${s.reliability_score * 100}%`,
+                          height: '100%',
+                          background: s.reliability_score > 0.8 ? 'var(--color-success)' : s.reliability_score > 0.6 ? 'var(--color-warning)' : 'var(--color-error)'
+                        }} />
+                      </div>
+                      <span style={{ fontSize: '0.68rem', fontFamily: 'var(--font-mono)', width: '32px' }}>{pct(s.reliability_score)}</span>
+                    </div>
+                  </td>
+                  <td style={{ fontFamily: 'var(--font-mono)' }}>{s.metadata?.average_lead_days ?? '—'} days</td>
+                  <td>{riskBadge(s.metadata?.price_risk ?? 'LOW')}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Product Pricing Matrix */}
+      <div className="card reveal" style={{ '--i': 2 } as any}>
+        <div className="card-header">
+          <div>
+            <div className="card-title">Product Pricing & Profit Optimization Ledger</div>
+            <div className="card-subtitle">{pricing.length} optimized stock items</div>
+          </div>
+        </div>
+        {pricing.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-icon"><MoneyIcon size={32} /></div>
+            <h3>No Product Telemetry</h3>
+            <p>Product database empty. Supply inventory coordinates.</p>
+          </div>
+        ) : (
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Optimized Item</th>
+                <th>SKU Hash</th>
+                <th>Base Cost</th>
+                <th>Optimized Target Price</th>
+                <th>Profit / Unit Margin</th>
+                <th>Est. Revenue Uplift (Annual)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pricing.map((p, i) => (
+                <tr key={i}>
+                  <td style={{ fontWeight: 600, color: 'var(--color-ink)' }}>{p.name}</td>
+                  <td><span className="badge blue">{p.sku}</span></td>
+                  <td style={{ fontFamily: 'var(--font-mono)' }}>${p.current_price?.toFixed(2)}</td>
+                  <td style={{ color: 'var(--color-success)', fontWeight: 700, fontFamily: 'var(--font-mono)' }}>${p.recommended_price?.toFixed(2)}</td>
+                  <td style={{ color: 'var(--color-info)', fontFamily: 'var(--font-mono)' }}>${p.expected_profit_per_unit?.toFixed(2)}</td>
+                  <td style={{ color: 'var(--color-warning)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{fmt(p.expected_revenue_uplift ?? 0)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Agents Page (Multi-Agent Engine) ──────────────────────────
+function AgentsPage() {
+  const [agents, setAgents] = useState<any[]>([])
+  const [loading, setLoading] = useState(false)
+  const [ran, setRan] = useState(false)
+
+  const run = useCallback(async () => {
+    setLoading(true)
+    try { const r = await getAgents(); setAgents(r.data.agents ?? []); setRan(true) }
+    finally { setLoading(false) }
+  }, [])
+
+  const riskColor = (r: string) => {
+    const norm = r?.toUpperCase()
+    return ({ CRITICAL: 'var(--color-error)', HIGH: 'var(--color-error)', MEDIUM: 'var(--color-warning)', LOW: 'var(--color-success)', UNKNOWN: 'var(--color-muted)' })[norm] ?? 'var(--color-muted)'
+  }
+
+  return (
+    <div className="page-body">
+      <div className="card reveal" style={{ '--i': 0 } as any}>
+        <div className="card-header">
+          <div>
+            <div className="card-title">Multi-Agent Intelligence Network</div>
+            <div className="card-subtitle">Parallel specialized LLM nodes orchestrated by CEO controller</div>
+          </div>
+          <button className="btn btn-primary" onClick={run} disabled={loading}>
+            {loading ? <><div className="spinner" /> Synthesizing Nodes…</> : <><Play size={14} /> Execute Analysis Run</>}
+          </button>
+        </div>
+        {!ran && !loading && (
+          <div className="empty-state" style={{ padding: 'var(--space-xl) 0' }}>
+            <div className="empty-icon" style={{ color: 'var(--color-accent)' }}><Bot size={40} /></div>
+            <h3>Engine Idle</h3>
+            <p>Awaiting trigger signal to invoke all 6 specialist agents. Each agent queries a distinct business subsystem matrix.</p>
+          </div>
+        )}
+      </div>
+
+      {loading && <AgentsPageSkeleton />}
+
+      {ran && !loading && (
+        <div className="agent-grid">
+          {agents.map((a, idx) => {
+            const meta = AGENT_META[a.agent_name] ?? { icon: '🤖', color: 'rgba(99,179,237,0.08)', border: 'var(--color-accent)' }
+            const rc = riskColor(a.risk_level)
+            return (
+              <div className="agent-card reveal" key={idx} style={{ '--i': idx + 1 } as any}>
+                <div className="agent-header">
+                  <div className="agent-avatar" style={{ '--agent-color': meta.color } as any}>{meta.icon}</div>
+                  <div>
+                    <div className="agent-name">{a.agent_name}</div>
+                    <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }}>
+                      <span className="badge" style={{ background: `${rc}12`, color: rc, borderColor: `${rc}25` }}>{a.risk_level}</span>
+                      <span className="badge blue">Confidence: {pct(a.confidence)}</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="agent-analysis">{a.analysis}</div>
+                <div className="agent-recs">
+                  {(a.recommendations ?? []).map((r: string, j: number) => (
+                    <div className="agent-rec" key={j} style={{ '--agent-border': meta.border } as any}>
+                      {r}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Simulate Page (Workbench Split Panel) ────────────────────
+function SimulatePage() {
+  const [form, setForm] = useState({
+    price_changes: '', new_hires: '', avg_new_hire_salary: '50000',
+    inventory_investment: '', loan_amount: '', loan_interest_rate_pct: '5',
+    marketing_spend: '', supplier_change: '',
+  })
+  const [result, setResult] = useState<any>(null)
+  const [loading, setLoading] = useState(false)
+
+  const run = async () => {
+    setLoading(true)
+    try {
+      const payload: any = {}
+      if (form.new_hires) payload.new_hires = parseInt(form.new_hires)
+      if (form.avg_new_hire_salary) payload.avg_new_hire_salary = parseFloat(form.avg_new_hire_salary)
+      if (form.inventory_investment) payload.inventory_investment = parseFloat(form.inventory_investment)
+      if (form.loan_amount) payload.loan_amount = parseFloat(form.loan_amount)
+      if (form.loan_interest_rate_pct) payload.loan_interest_rate_pct = parseFloat(form.loan_interest_rate_pct)
+      if (form.marketing_spend) payload.marketing_spend = parseFloat(form.marketing_spend)
+      if (form.supplier_change) payload.supplier_change = form.supplier_change
+      const r = await simulate(payload)
+      setResult(r.data)
+    } finally { setLoading(false) }
+  }
+
+  const set = (k: string, v: string) => setForm(f => ({ ...f, [k]: v }))
+
+  const healthColor = result?.business_health_score >= 70 ? 'var(--color-success)' : result?.business_health_score >= 40 ? 'var(--color-warning)' : 'var(--color-error)'
+
+  return (
+    <div className="page-body">
+      <div className="bento-grid">
+        {/* Left Side: Input Parameters Console */}
+        <div className="col-5 card reveal" style={{ '--i': 0 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">Digital Twin Simulation Console</div>
+              <div className="card-subtitle">Model hypothetical scenarios without mutating system database</div>
+            </div>
+          </div>
+
+          <div className="form-grid" style={{ gridTemplateColumns: '1fr' }}>
+            {[
+              { label: 'New Hires Matrix Count', key: 'new_hires', placeholder: 'e.g. 3' },
+              { label: 'Mean Salary Budget ($/yr)', key: 'avg_new_hire_salary', placeholder: '50000' },
+              { label: 'Inventory Procurement ($)', key: 'inventory_investment', placeholder: 'e.g. 10000' },
+              { label: 'Hypothetical Loan Credit ($)', key: 'loan_amount', placeholder: 'e.g. 50000' },
+              { label: 'Annual Loan Interest Rate (%)', key: 'loan_interest_rate_pct', placeholder: '5' },
+              { label: 'Monthly Marketing Budget ($)', key: 'marketing_spend', placeholder: 'e.g. 2000' },
+            ].map(f => (
+              <div className="form-group" key={f.key}>
+                <label className="form-label">{f.label}</label>
+                <input className="form-input" type="number" placeholder={f.placeholder}
+                  value={(form as any)[f.key]} onChange={e => set(f.key, e.target.value)} />
+              </div>
+            ))}
+            <div className="form-group">
+              <label className="form-label">Supplier Consolidation Strategy</label>
+              <select className="form-input" style={{ background: 'var(--color-paper-3)' }} value={form.supplier_change} onChange={e => set('supplier_change', e.target.value)}>
+                <option value="">No change vector</option>
+                <option value="diversify">Diversify provider channels</option>
+                <option value="single_source">Consolidate single channel</option>
+              </select>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 'var(--space-2xs)' }}>
+            <button className="btn btn-primary" style={{ width: '100%' }} onClick={run} disabled={loading}>
+              {loading ? <><div className="spinner" />Simulating Telemetry…</> : <><Activity size={14} /> Calculate Scenarios</>}
+            </button>
+          </div>
+        </div>
+
+        {/* Right Side: Projections Output Ledger */}
+        <div className="col-7 card reveal" style={{ '--i': 1 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">Digital Twin Projections Telemetry</div>
+              <div className="card-subtitle">Projected outputs for input scenario profile</div>
+            </div>
+            {result && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ fontSize: '0.68rem', color: 'var(--color-muted)', fontFamily: 'var(--font-mono)' }}>Health Score</span>
+                <span style={{ fontSize: 'var(--text-lg)', fontWeight: 800, color: healthColor, fontFamily: 'var(--font-mono)' }}>{result.business_health_score}</span>
+              </div>
+            )}
+          </div>
+
+          {!result ? (
+            <div className="empty-state" style={{ height: '100%', minHeight: '380px' }}>
+              <div className="empty-icon"><Sliders size={36} /></div>
+              <h3>Telemetry Engine Idle</h3>
+              <p>Configure parameters on the left console panel and execute simulation run to render twin predictions.</p>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.72rem', color: 'var(--color-accent)' }}>
+                SCENARIO PROFILE: {result.scenario_label}
+              </div>
+
+              <div className="sim-results-grid">
+                {[
+                  { l: 'Projected Gross Revenue', v: result.projected_revenue, c: 'var(--color-success)' },
+                  { l: 'Projected Net Margin', v: result.projected_profit, c: result.projected_profit >= 0 ? 'var(--color-success)' : 'var(--color-error)' },
+                  { l: 'Projected Net Cash Flow', v: result.projected_cash_flow, c: 'var(--color-info)' },
+                  { l: 'Aggregate Risk Variable', v: result.risk_score, c: result.risk_score > 0.5 ? 'var(--color-error)' : 'var(--color-success)' },
+                  { l: 'Inventory Pipeline Health', v: result.inventory_health, c: result.inventory_health === 'HEALTHY' ? 'var(--color-success)' : 'var(--color-warning)' },
+                  { l: 'Synthetic Health Index', v: result.business_health_score, c: healthColor },
+                ].map(r => (
+                  <div className="sim-result-tile" key={r.l}>
+                    <div className="sim-result-label">{r.l}</div>
+                    <div className="sim-result-value" style={{ color: r.c }}>
+                      {typeof r.v === 'number' ? (
+                        <NumberTicker value={r.v} formatFn={r.l.includes('Variable') ? pct : fmt} />
+                      ) : r.v}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {result.key_insights?.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3xs)' }}>
+                  <div style={{ fontSize: '0.68rem', fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--color-muted)' }}>SYNTHETIC INSIGHT LOG</div>
+                  {result.key_insights.map((ins: string, i: number) => (
+                    <div key={i} style={{ fontSize: 'var(--text-xs)', color: 'var(--color-ink-2)', padding: '8px 12px', background: 'var(--color-paper-3)', borderRadius: 'var(--radius-card)', borderLeft: '3px solid var(--color-accent)', lineHeight: 1.5 }}>
+                      {ins}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {result.warnings?.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3xs)' }}>
+                  <div style={{ fontSize: '0.68rem', fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--color-warning)' }}>SIMULATION ALERTS & RISKS</div>
+                  {result.warnings.map((w: string, i: number) => (
+                    <div key={i} style={{ fontSize: 'var(--text-xs)', color: 'var(--color-warning)', padding: '8px 12px', background: 'oklch(72% 0.15 75 / 0.08)', borderRadius: 'var(--radius-card)', borderLeft: '3px solid var(--color-warning)', lineHeight: 1.5 }}>
+                      {w}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Markdown Rendering Helpers ───────────────────────────────
+function parseInlineMarkdown(text: string): React.ReactNode[] {
+  const parts: React.ReactNode[] = [];
+  const inlineRegex = /(\*\*|`)(.*?)\1/g;
+  let match;
+  let lastIndex = 0;
+  let key = 0;
+
+  while ((match = inlineRegex.exec(text)) !== null) {
+    const type = match[1];
+    const content = match[2];
+    const matchIndex = match.index;
+
+    if (matchIndex > lastIndex) {
+      parts.push(text.substring(lastIndex, matchIndex));
+    }
+
+    if (type === '**') {
+      parts.push(<strong key={`b-${key++}`} style={{ fontWeight: 700, color: 'var(--color-ink)' }}>{content}</strong>);
+    } else if (type === '`') {
+      parts.push(
+        <code key={`c-${key++}`} style={{
+          fontFamily: 'var(--font-mono)',
+          fontSize: '0.85em',
+          background: 'var(--color-paper-3)',
+          padding: '2px 4px',
+          borderRadius: '4px',
+          border: '1px solid var(--color-rule-2)'
+        }}>
+          {content}
+        </code>
+      );
+    }
+
+    lastIndex = inlineRegex.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    parts.push(text.substring(lastIndex));
+  }
+
+  return parts.length > 0 ? parts : [text];
+}
+
+function renderMarkdown(text: string): React.ReactNode[] {
+  const lines = text.split('\n');
+  const elements: React.ReactNode[] = [];
+
+  let currentTable: string[][] = [];
+  let currentList: { items: string[]; type: 'unordered' | 'ordered' } | null = null;
+  let keyCounter = 0;
+
+  const flushTable = (key: number) => {
+    if (currentTable.length === 0) return null;
+    const tableData = [...currentTable];
+    currentTable = [];
+
+    let startIndex = 0;
+    let headers: string[] = [];
+
+    const isDivider = (row: string[]) => row.every(cell => /^:?-+:?$/.test(cell.trim()));
+
+    if (tableData.length > 1 && isDivider(tableData[1])) {
+      headers = tableData[0];
+      startIndex = 2;
+    } else if (tableData.length > 0) {
+      headers = tableData[0];
+      startIndex = 1;
+    }
+
+    return (
+      <div key={`table-${key}`} style={{ overflowX: 'auto', margin: 'var(--space-xs) 0', border: '1px solid var(--color-rule)', borderRadius: 'var(--radius-card)', width: '100%' }}>
+        <table className="data-table" style={{ width: '100%', borderCollapse: 'collapse', margin: 0 }}>
+          {headers.length > 0 && (
+            <thead>
+              <tr style={{ background: 'var(--color-paper-2)' }}>
+                {headers.map((h, i) => (
+                  <th key={i} style={{ padding: '8px 12px', borderBottom: '1px solid var(--color-rule)', fontFamily: 'var(--font-mono)', fontSize: '0.68rem', fontWeight: 600, textTransform: 'uppercase', color: 'var(--color-muted)', textAlign: 'left' }}>
+                    {parseInlineMarkdown(h.trim())}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+          )}
+          <tbody>
+            {tableData.slice(startIndex).map((row, rowIndex) => (
+              <tr key={rowIndex} style={{ borderBottom: rowIndex === tableData.length - startIndex - 1 ? 'none' : '1px solid var(--color-rule-2)' }}>
+                {row.map((cell, cellIndex) => (
+                  <td key={cellIndex} style={{ padding: '8px 12px', color: 'var(--color-ink-2)', fontSize: 'var(--text-xs)' }}>
+                    {parseInlineMarkdown(cell.trim())}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  const flushList = (key: number) => {
+    if (!currentList) return null;
+    const list = { ...currentList };
+    currentList = null;
+
+    const ListTag = list.type === 'ordered' ? 'ol' : 'ul';
+    const listStyle = list.type === 'ordered'
+      ? { listStyleType: 'decimal', paddingLeft: 'var(--space-md)', margin: 'var(--space-2xs) 0' }
+      : { listStyleType: 'disc', paddingLeft: 'var(--space-md)', margin: 'var(--space-2xs) 0' };
+
+    return (
+      <ListTag key={`list-${key}`} style={listStyle}>
+        {list.items.map((item, i) => (
+          <li key={i} style={{ margin: '4px 0', color: 'var(--color-ink-2)', fontSize: 'var(--text-xs)', lineHeight: 1.5 }}>
+            {parseInlineMarkdown(item)}
+          </li>
+        ))}
+      </ListTag>
+    );
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('|')) {
+      if (currentList) {
+        elements.push(flushList(keyCounter++));
+      }
+
+      const cells = line.split('|').map(c => c.trim());
+      if (line.startsWith('|')) cells.shift();
+      if (line.endsWith('|')) cells.pop();
+
+      currentTable.push(cells);
+      continue;
+    } else if (currentTable.length > 0) {
+      elements.push(flushTable(keyCounter++));
+    }
+
+    const listMatch = trimmed.match(/^([-*+]|\d+\.)\s+(.*)/);
+    if (listMatch) {
+      const marker = listMatch[1];
+      const content = listMatch[2];
+      const type = /^\d+/.test(marker) ? 'ordered' : 'unordered';
+
+      if (currentList && currentList.type !== type) {
+        elements.push(flushList(keyCounter++));
+      }
+
+      if (!currentList) {
+        currentList = { items: [], type };
+      }
+
+      currentList.items.push(content);
+      continue;
+    } else if (currentList) {
+      elements.push(flushList(keyCounter++));
+    }
+
+    if (trimmed.startsWith('#')) {
+      const headerLevel = (trimmed.match(/^#+/) || ['#'])[0].length;
+      const headerText = trimmed.replace(/^#+\s*/, '');
+      const fontSize = headerLevel === 1 ? 'var(--text-md)' : headerLevel === 2 ? 'var(--text-sm)' : 'var(--text-xs)';
+      const style = {
+        fontFamily: 'var(--font-display)',
+        fontWeight: 700,
+        color: 'var(--color-ink)',
+        margin: 'var(--space-xs) 0 var(--space-2xs)',
+        fontSize
+      };
+
+      const HeaderTag = `h${Math.min(6, headerLevel + 2)}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
+      elements.push(
+        <HeaderTag key={keyCounter++} style={style}>
+          {parseInlineMarkdown(headerText)}
+        </HeaderTag>
+      );
+      continue;
+    }
+
+    if (trimmed === '') {
+      continue;
+    }
+
+    elements.push(
+      <p key={keyCounter++} style={{ margin: '6px 0', color: 'var(--color-ink-2)', lineHeight: 1.6 }}>
+        {parseInlineMarkdown(line)}
+      </p>
+    );
+  }
+
+  if (currentTable.length > 0) {
+    elements.push(flushTable(keyCounter++));
+  }
+  if (currentList) {
+    elements.push(flushList(keyCounter++));
+  }
+
+  return elements;
+}
+
+// ─── Chat Page (Terminal Interface) ──────────────────────────
+function ChatPage() {
+  const [messages, setMessages] = useState<{ role: 'user' | 'ai'; text: string; model?: string }[]>([
+    { role: 'ai', text: 'SME OS Intelligence System initialized. Inquire regarding database coordinates, risk indices, liquidity models, or operations.' }
+  ])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+
+  const send = async () => {
+    if (!input.trim() || loading) return
+    const q = input.trim()
+    setInput('')
+    setMessages(m => [...m, { role: 'user', text: q }])
+    setLoading(true)
+    try {
+      const r = await sendChat(q)
+      setMessages(m => [...m, { role: 'ai', text: r.data.response, model: r.data.model_used }])
+    } catch {
+      setMessages(m => [...m, { role: 'ai', text: 'Simulation engine error. Verify model service runs at target port.' }])
+    } finally { setLoading(false) }
+  }
+
+  return (
+    <div className="page-body" style={{ flex: 1 }}>
+      <div className="card reveal" style={{ flex: 1, display: 'flex', flexDirection: 'column', height: 'calc(100vh - 180px)', '--i': 0 } as any}>
+        <div className="card-header">
+          <div>
+            <div className="card-title">AI Engine Chat Console</div>
+            <div className="card-subtitle">Context-aware agent execution interface via local Gemma node</div>
+          </div>
+        </div>
+
+        <div className="chat-messages">
+          {messages.map((m, i) => (
+            <div className={`chat-bubble ${m.role}`} key={i}>
+              {m.role === 'ai' && <div className="bubble-label">{m.model ?? 'SME-OS AI Core'}</div>}
+              {renderMarkdown(m.text)}
+            </div>
+          ))}
+          {loading && <div className="chat-bubble ai"><div className="bubble-label">LLM Core processing…</div><div className="spinner" /></div>}
+        </div>
+
+        <div className="chat-input-row">
+          <input className="chat-input" value={input} onChange={e => setInput(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && send()}
+            placeholder="Type query to prompt LLM system… e.g. 'What supplier risks exist in database?'" />
+          <button className="btn btn-primary" onClick={send} disabled={loading || !input.trim()}><Send size={12} /> Prompt</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Executive Brief Page ────────────────────────────────────
+function BriefPage() {
+  const [brief, setBrief] = useState<any>(null)
+  const [loading, setLoading] = useState(false)
+
+  const fetch = async () => {
+    setLoading(true)
+    try { const r = await getExecutiveBrief(); setBrief(r.data) }
+    finally { setLoading(false) }
+  }
+
+  useEffect(() => {
+    fetch()
+  }, [])
+
+  return (
+    <div className="page-body">
+      <div className="card reveal" style={{ '--i': 0 } as any}>
+        <div className="card-header">
+          <div>
+            <div className="card-title">CEO Executive Report Brief</div>
+            <div className="card-subtitle">Auto-generated morning executive overview telemetry</div>
+          </div>
+          <button className="btn btn-primary" onClick={fetch} disabled={loading}>
+            {loading ? <><div className="spinner" />Compiling Ledger…</> : <><Sparkles size={14} /> Generate Executive Brief</>}
+          </button>
+        </div>
+        {!brief && !loading && (
+          <div className="empty-state" style={{ padding: 'var(--space-xl) 0' }}>
+            <div className="empty-icon" style={{ color: 'var(--color-accent)' }}><FileText size={40} /></div>
+            <h3>Report Engine Ready</h3>
+            <p>Generate summary matrix based on operations data.</p>
+          </div>
+        )}
+        {loading && <BriefPageSkeleton />}
+      </div>
+
+      {brief && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
+          <div className="card reveal" style={{ '--i': 1 } as any}>
+            <div className="card-title" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <Calendar size={16} style={{ color: 'var(--color-accent)' }} /> Morning Executive Summary
+            </div>
+            <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-ink-2)', lineHeight: 1.6, padding: 'var(--space-3xs) 0' }}>{brief.morning_summary}</p>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 'var(--space-sm)' }}>
+            {[
+              { title: 'Critical Event Risks', items: brief.critical_alerts, color: 'var(--color-error)', bg: 'oklch(62% 0.18 25 / 0.08)', delay: 2 },
+              { title: 'Identified Opportunities', items: brief.top_opportunities, color: 'var(--color-success)', bg: 'oklch(68% 0.16 145 / 0.08)', delay: 3 },
+              { title: 'Action Ledger Recommendations', items: brief.top_actions, color: 'var(--color-accent)', bg: 'oklch(60% 0.18 250 / 0.08)', delay: 4 },
+            ].map(s => (
+              <div className="card reveal" key={s.title} style={{ borderLeft: `3px solid ${s.color}`, '--i': s.delay } as any}>
+                <div className="card-title" style={{ fontFamily: 'var(--font-display)', marginBottom: 'var(--space-xs)' }}>{s.title}</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2xs)' }}>
+                  {(s.items ?? []).map((item: string, i: number) => (
+                    <div key={i} style={{ fontSize: 'var(--text-xs)', color: 'var(--color-ink-2)', padding: '8px 12px', background: s.bg, borderRadius: 'var(--radius-card)', lineHeight: 1.45 }}>
+                      {item}
+                    </div>
+                  ))}
+                  {(s.items ?? []).length === 0 && <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>No items logged.</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="card reveal" style={{ '--i': 5 } as any}>
+            <div className="card-title">Macro Health Summary</div>
+            <p style={{ fontSize: 'var(--text-xs)', color: 'var(--color-ink-2)', lineHeight: 1.6 }}>{brief.business_health_summary}</p>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Decision History Page ────────────────────────────────────
+function HistoryPage() {
+  const [history, setHistory] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    getDecisionHistory().then(r => setHistory(r.data)).finally(() => setLoading(false))
+  }, [])
+
+  if (loading) return <HistoryPageSkeleton />
+
+  return (
+    <div className="page-body">
+      <div className="card reveal" style={{ '--i': 0 } as any}>
+        <div className="card-header">
+          <div>
+            <div className="card-title">Decision Execution History Ledger</div>
+            <div className="card-subtitle">Immutable registry of actions executed on AI recommendations</div>
+          </div>
+        </div>
+        {history.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-icon"><History size={32} /></div>
+            <h3>History Clear</h3>
+            <p>Decisions ledger is empty. Telemetry will write as actions are taken.</p>
+          </div>
+        ) : (
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>User Decision Action</th>
+                <th>Calculated Outcome Description</th>
+                <th>Revenue Delta Impact</th>
+                <th>User Metadata Feedback</th>
+                <th>Execution Timestamp</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history.map((h, i) => (
+                <tr key={i}>
+                  <td>
+                    <span className={`badge ${h.user_action === 'APPROVED' ? 'green' : h.user_action === 'REJECTED' ? 'red' : 'amber'}`}>
+                      {h.user_action}
+                    </span>
+                  </td>
+                  <td style={{ fontSize: 'var(--text-xs)', color: 'var(--color-ink)' }}>{h.business_outcome ?? '—'}</td>
+                  <td style={{ fontFamily: 'var(--font-mono)', color: h.outcome_revenue_impact >= 0 ? 'var(--color-success)' : 'var(--color-error)' }}>
+                    {h.outcome_revenue_impact ? fmt(h.outcome_revenue_impact) : '—'}
+                  </td>
+                  <td style={{ fontSize: 'var(--text-xs)', color: 'var(--color-ink-2)' }}>{h.feedback ?? '—'}</td>
+                  <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.68rem', color: 'var(--color-muted)' }}>
+                    {new Date(h.timestamp).toLocaleDateString()}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Upload Page (Document Ingestion) ──────────────────────────
+function UploadPage() {
+  const [file, setFile] = useState<File | null>(null)
+  const [category, setCategory] = useState('invoice')
+  const [loading, setLoading] = useState(false)
+  const [message, setMessage] = useState('')
+  const [isError, setIsError] = useState(false)
+  const [activeSample, setActiveSample] = useState<string | null>(null)
+
+  const handleUpload = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!file) return
+    setLoading(true)
+    setMessage('')
+    setIsError(false)
+    try {
+      const res = await uploadFile(category, file)
+      setMessage(res.data.message || 'File uploaded successfully!')
+      setFile(null)
+      const fileInput = document.getElementById('file-input-el') as HTMLInputElement
+      if (fileInput) fileInput.value = ''
+    } catch (err: any) {
+      setIsError(true)
+      setMessage(err.response?.data?.detail || 'Error uploading file.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleSampleClick = async (sampleKey: string) => {
+    setActiveSample(sampleKey)
+    setMessage('')
+    setIsError(false)
+    try {
+      const res = await uploadSampleDoc(sampleKey)
+      setMessage(res.data.message || `Sample '${sampleKey}' queued successfully!`)
+    } catch (err: any) {
+      setIsError(true)
+      setMessage(err.response?.data?.detail || 'Error loading sample document.')
+    } finally {
+      setActiveSample(null)
+    }
+  }
+
+  const samples = [
+    { key: 'inventory', label: 'Inventory (Excel)', folder: 'inventory/', file: 'inventory.xlsx' },
+    { key: 'invoice_001', label: 'ABC Steel Invoice (PDF)', folder: 'invoices/', file: 'invoice_001.pdf' },
+    { key: 'invoice_002', label: 'ABC Retail Sales Invoice (PDF)', folder: 'invoices/', file: 'invoice_002.pdf' },
+    { key: 'overdue_invoice', label: 'Metro Electronics Overdue Bill (PDF)', folder: 'invoices/', file: 'overdue_invoice.pdf' },
+    { key: 'gst_return', label: 'June GST Return (PDF)', folder: 'gst/', file: 'gst_return_june.pdf' },
+    { key: 'bank_statement', label: 'July Bank Statement (CSV)', folder: 'bank/', file: 'bank_statement.csv' },
+    { key: 'july_statement', label: 'July Bank Statement (Excel)', folder: 'bank/', file: 'july_statement.xlsx' },
+    { key: 'price_increase', label: 'ABC Steel 8% Price Hike Notice (PDF)', folder: 'suppliers/', file: 'price_increase_notice.pdf' },
+    { key: 'po_2101', label: 'ABC Retail Purchase Order (PDF)', folder: 'purchase_orders/', file: 'po_2101.pdf' },
+  ]
+
+  return (
+    <div className="page-body">
+      <div className="bento-grid">
+        {/* Upload Form Card */}
+        <div className="col-6 card reveal" style={{ '--i': 0 } as any}>
+          <div className="card-header" style={{ marginBottom: 'var(--space-sm)' }}>
+            <div>
+              <div className="card-title">Document Ingestion Terminal</div>
+              <div className="card-subtitle">Upload transaction docs or sheets to update business ledger</div>
+            </div>
+          </div>
+
+          <form onSubmit={handleUpload} style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
+            <div className="form-group">
+              <label className="form-label" style={{ display: 'block', marginBottom: '6px', fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>Document Category</label>
+              <select
+                className="form-input"
+                style={{ width: '100%', padding: '10px', borderRadius: 'var(--radius-card)', background: 'var(--color-paper-3)', border: '1px solid var(--color-rule)', color: 'var(--color-ink)' }}
+                value={category}
+                onChange={e => setCategory(e.target.value)}
+              >
+                <option value="invoice">Supplier / Customer Invoice</option>
+                <option value="gst">GST Return Summary</option>
+                <option value="bank">Bank Statement</option>
+                <option value="excel">Excel Bulk Data (Inventory)</option>
+                <option value="supplier_notice">Supplier Notice (Price Hike)</option>
+                <option value="purchase_order">Customer Purchase Order (PO)</option>
+              </select>
+            </div>
+
+            <div className="form-group" style={{ marginTop: 'var(--space-2xs)' }}>
+              <label className="form-label" style={{ display: 'block', marginBottom: '6px', fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>Select Document File</label>
+              <div style={{
+                border: '2px dashed var(--color-rule)',
+                borderRadius: 'var(--radius-card)',
+                padding: 'var(--space-md) var(--space-xs)',
+                textAlign: 'center',
+                background: 'var(--color-paper-3)',
+                cursor: 'pointer',
+                transition: 'all 120ms ease',
+              }} onClick={() => document.getElementById('file-input-el')?.click()}>
+                <span style={{ fontSize: '1.5rem', display: 'block', marginBottom: '8px' }}>📂</span>
+                <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-ink-2)' }}>
+                  {file ? file.name : 'Click to select file…'}
+                </span>
+                <input
+                  id="file-input-el"
+                  type="file"
+                  style={{ display: 'none' }}
+                  onChange={e => {
+                    if (e.target.files && e.target.files.length > 0) {
+                      setFile(e.target.files[0])
+                    }
+                  }}
+                />
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              className="btn btn-primary"
+              style={{ width: '100%', marginTop: 'var(--space-sm)' }}
+              disabled={loading || !file}
+            >
+              {loading ? <><div className="spinner" /> Ingesting File...</> : <><Upload size={14} style={{ marginRight: '6px' }} /> Ingest Document</>}
+            </button>
+
+            {message && (
+              <div style={{
+                padding: '10px 14px',
+                borderRadius: 'var(--radius-card)',
+                background: isError ? 'rgba(239,68,68,0.08)' : 'rgba(16,185,129,0.08)',
+                border: `1px solid ${isError ? 'var(--color-error)' : 'var(--color-success)'}`,
+                color: isError ? 'var(--color-error)' : 'var(--color-success)',
+                fontSize: 'var(--text-xs)',
+                lineHeight: 1.5,
+                marginTop: 'var(--space-xs)',
+              }}>
+                {message}
+              </div>
+            )}
+          </form>
+        </div>
+
+        {/* Demo Fast Ingestion List Card */}
+        <div className="col-6 card reveal" style={{ '--i': 1 } as any}>
+          <div className="card-header" style={{ marginBottom: 'var(--space-sm)' }}>
+            <div>
+              <div className="card-title">Demo Quick-Load Panel</div>
+              <div className="card-subtitle">Single-click load of local sample business documents</div>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2xs)', maxHeight: '380px', overflowY: 'auto', paddingRight: '4px' }}>
+            {samples.map(sample => (
+              <div key={sample.key} style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: 'var(--space-2xs) var(--space-xs)',
+                background: 'var(--color-paper-3)',
+                borderRadius: 'var(--radius-card)',
+                border: '1px solid var(--color-rule-2)',
+              }}>
+                <div style={{ marginRight: 'var(--space-xs)' }}>
+                  <div style={{ fontSize: 'var(--text-xs)', fontWeight: 600, color: 'var(--color-ink)' }}>{sample.label}</div>
+                  <div style={{ fontSize: '8px', fontFamily: 'var(--font-mono)', color: 'var(--color-muted)' }}>
+                    sample_docs/{sample.folder}{sample.file}
+                  </div>
+                </div>
+                <button
+                  className="btn btn-secondary"
+                  style={{ fontSize: '9px', padding: '4px 10px', height: '28px', whiteSpace: 'nowrap' }}
+                  onClick={() => handleSampleClick(sample.key)}
+                  disabled={activeSample !== null}
+                >
+                  {activeSample === sample.key ? <div className="spinner" /> : 'Load File'}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Nav definitions with Lucide Icons
+const NAV_CLEAN = [
+  { id: 'dashboard' as Page, label: 'Telemetry Dashboard', icon: <LayoutDashboard size={16} />, section: 'Overview' },
+  { id: 'brief' as Page, label: 'Executive Brief', icon: <FileText size={16} />, section: undefined },
+  { id: 'forecast' as Page, label: 'Predictive Forecast', icon: <TrendingUp size={16} />, section: 'Intelligence' },
+  { id: 'risk' as Page, label: 'Risk & Pricing', icon: <ShieldAlert size={16} />, section: undefined },
+  { id: 'agents' as Page, label: 'AI Agents Grid', icon: <Bot size={16} />, section: undefined },
+  { id: 'simulate' as Page, label: 'Digital Twin Sim', icon: <Sliders size={16} />, section: 'Decision' },
+  { id: 'chat' as Page, label: 'AI Chat Core', icon: <MessageSquare size={16} />, section: 'AI Layer' },
+  { id: 'upload' as Page, label: 'Document Ingestion', icon: <Upload size={16} />, section: 'Ingestion' },
+  { id: 'history' as Page, label: 'Decision History', icon: <History size={16} />, section: 'Audit' },
+]
+
+const PAGE_TITLES: Record<Page, string> = {
+  dashboard: 'Operations Telemetry Dashboard',
+  forecast: 'Predictive Forecasting Module',
+  risk: 'Risk & Pricing Optimisation',
+  agents: 'Multi-Agent Network Engine',
+  simulate: 'Digital Twin Simulation Console',
+  chat: 'AI Core Conversation',
+  brief: 'Morning Executive Brief',
+  history: 'Decision Execution Registry',
+  upload: 'Automated Document Ingestion Console',
+}
+
+export default function App() {
+  const [page, setPage] = useState<Page>('dashboard')
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    return (localStorage.getItem('theme') as 'light' | 'dark') || 'dark'
+  })
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('theme', theme)
+    const favicon = document.getElementById('favicon') as HTMLLinkElement | null
+    if (favicon) {
+      const parent = favicon.parentNode
+      if (parent) {
+        const newFavicon = document.createElement('link')
+        newFavicon.id = 'favicon'
+        newFavicon.rel = 'icon'
+        newFavicon.type = 'image/png'
+        newFavicon.href = (theme === 'dark' ? '/logo-dark.png' : '/logo-light.png') + '?v=' + Date.now()
+        parent.replaceChild(newFavicon, favicon)
+      }
+    }
+  }, [theme])
+
+  const renderPage = () => {
+    switch (page) {
+      case 'dashboard': return <DashboardPage />
+      case 'forecast': return <ForecastPage />
+      case 'risk': return <RiskPage />
+      case 'agents': return <AgentsPage />
+      case 'simulate': return <SimulatePage />
+      case 'chat': return <ChatPage />
+      case 'brief': return <BriefPage />
+      case 'history': return <HistoryPage />
+      case 'upload': return <UploadPage />
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      {/* Sidebar Navigation */}
+      <nav className="sidebar">
+        <div className="sidebar-brand">
+          <div className="logo-icon">
+            <img
+              src="/logo-dark.png"
+              alt="Stratify"
+              className="logo-img"
+              style={{ display: theme === 'dark' ? 'block' : 'none' }}
+            />
+            <img
+              src="/logo-light.png"
+              alt="Stratify"
+              className="logo-img"
+              style={{ display: theme === 'light' ? 'block' : 'none' }}
+            />
+          </div>
+          <div>
+            <h1>Stratify</h1>
+            <span>Business Core</span>
+          </div>
+        </div>
+
+        {NAV_CLEAN.map((item, i) => (
+          <div key={i}>
+            {item.section && <div className="sidebar-section-label">{item.section}</div>}
+            <div
+              className={`nav-item ${page === item.id ? 'active' : ''}`}
+              onClick={() => setPage(item.id)}
+            >
+              <span className="nav-icon">{item.icon}</span>
+              {item.label}
+            </div>
+          </div>
+        ))}
+
+        <div className="sidebar-footer">
+          <button
+            className="theme-toggle"
+            onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+            aria-label="Toggle theme"
+          >
+            <span className="theme-toggle-icon">
+              {theme === 'light' ? <Sun size={14} /> : <Moon size={14} />}
+            </span>
+            <span className="theme-toggle-text">
+              {theme === 'light' ? 'Light mode' : 'Dark mode'}
+            </span>
+          </button>
+        </div>
+      </nav>
+
+      {/* Main Console Content */}
+      <div className="main-content">
+        <div className="topbar">
+          <div>
+            <div className="topbar-title">{PAGE_TITLES[page]}</div>
+            <div className="topbar-subtitle">SME Business Operating System</div>
+          </div>
+        </div>
+        <div key={page} className="page-transition-container">
+          {renderPage()}
+        </div>
+      </div>
+    </div>
+  )
+}
