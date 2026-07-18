@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.models.business import Company, Customer, Supplier, Product
 from app.models.history import BusinessEvent, RecommendationHistory, DecisionHistory
+from app.models.materials import RawMaterial, MaterialPriceHistory
 from typing import Dict, Any, List
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,29 @@ class BusinessMemoryService:
         except Exception as e:
             logger.error("Could not fetch risky suppliers for context: %s", e)
 
+        material_price_history = []
+        try:
+            stmt = select(RawMaterial)
+            materials = (await db.execute(stmt)).scalars().all()
+            for m in materials:
+                hist_stmt = select(MaterialPriceHistory).where(MaterialPriceHistory.material_id == m.id).order_by(MaterialPriceHistory.recorded_at.desc()).limit(10)
+                histories = (await db.execute(hist_stmt)).scalars().all()
+                material_price_history.append({
+                    "material_id": m.id,
+                    "name": m.name,
+                    "current_price": m.current_unit_price,
+                    "unit": m.unit,
+                    "history": [
+                        {
+                            "recorded_price": h.recorded_price,
+                            "recorded_at": h.recorded_at.isoformat(),
+                            "source": h.source
+                        } for h in histories
+                    ]
+                })
+        except Exception as e:
+            logger.error("Could not fetch material price history for context: %s", e)
+
         return {
             "profile": profile,
             "recent_events": recent_events,
@@ -108,6 +132,7 @@ class BusinessMemoryService:
             "decision_history": recent_decisions,
             "low_stock_products": low_stock_products,
             "top_customers": top_customers,
-            "risky_suppliers": risky_suppliers
+            "risky_suppliers": risky_suppliers,
+            "material_price_history": material_price_history
         }
 

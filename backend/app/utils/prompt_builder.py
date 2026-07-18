@@ -202,6 +202,49 @@ class PromptBuilder:
         )
         return prompt
 
+    @classmethod
+    def build_procurement_agent_prompt(cls, context: Dict[str, Any]) -> str:
+        """Build a specialist prompt for ProcurementAgent to analyze raw materials prices."""
+        material_history = context.get("material_price_history", [])
+        
+        prompt = cls._SYSTEM_PREAMBLE
+        prompt += "You are the ProcurementAgent of SME-OS — responsible for Raw Materials and Procurement Timing.\n"
+        prompt += "Your focus area: raw material price trend analysis, cost forecasting, and spot price monitoring.\n\n"
+        
+        prompt += "=== RAW MATERIAL PRICE HISTORY ===\n"
+        if not material_history:
+            prompt += "  No raw material price history available on record.\n"
+        else:
+            for item in material_history:
+                prompt += f"  Material: {item['name']} (ID: {item['material_id']}, Unit: {item['unit']})\n"
+                prompt += f"    Current Spot Price: ${item['current_price']:.2f}\n"
+                prompt += "    Price History (Newest first):\n"
+                history_list = item.get("history", [])
+                if not history_list:
+                    prompt += "      No historical price entries recorded.\n"
+                for h in history_list:
+                    prompt += f"      - ${h['recorded_price']:.2f} at {h['recorded_at']} (Source: {h['source']})\n"
+        prompt += "\n"
+        
+        prompt += (
+            "Analyze the trailing 90-day price trend against the current spot price.\n"
+            "For each raw material, provide exactly one recommended action: STOCKPILE, DELAY, or HOLD.\n"
+            "Include a one-sentence justification per material tied directly to the actual price numbers in context. Do not invent any figures.\n\n"
+            "You MUST respond ONLY in valid, single-line-safe JSON with the exact keys:\n"
+            "{\n"
+            '  "analysis": "<brief overall analysis of material cost trends>",\n'
+            '  "recommendations": [\n'
+            '    "<material name>: [STOCKPILE|DELAY|HOLD] - <justification containing actual price numbers>"\n'
+            '  ],\n'
+            '  "risk_level": "<LOW|MEDIUM|HIGH|CRITICAL>",\n'
+            '  "confidence": <float between 0.0 and 1.0>,\n'
+            '  "supporting_evidence": [\n'
+            '    "<evidence point 1 with price figures>"\n'
+            '  ]\n'
+            "}\n"
+        )
+        return prompt
+
     # ----------------------------------------------------------------
     # CEO Synthesis Prompt
     # ----------------------------------------------------------------
@@ -243,5 +286,54 @@ class PromptBuilder:
             "3. STRATEGIC DECISIONS: 3 key decisions the owner must make this week\n"
             "4. BUSINESS RISKS: Top 3 risks with severity\n"
             "5. GROWTH OPPORTUNITIES: 2-3 opportunities to pursue now\n"
+        )
+        return prompt
+
+    @classmethod
+    def build_strategy_brief_prompt(
+        cls,
+        agent_reports: List[Dict[str, Any]],
+        context: Dict[str, Any],
+    ) -> str:
+        """Build the CEO Agent prompt for the 4-point strategy brief with explainability citations."""
+        profile = context.get("profile", {})
+        
+        prompt = cls._SYSTEM_PREAMBLE
+        prompt += "You are the CEO Agent of SME-OS. Your task is to produce a 4-point Executive Strategy Brief.\n"
+        prompt += f"Company: {profile.get('name')} | Cash: ${profile.get('cash_balance', 0):,.2f}\n\n"
+        
+        prompt += "=== ACTIVE SPECIALIST REPORTS ===\n"
+        for report in agent_reports:
+            name = report.get('agent_name', 'Unknown')
+            prompt += f"\n[{name} - Risk: {report.get('risk_level', 'MEDIUM')}]\n"
+            prompt += f"  Analysis: {report.get('analysis')}\n"
+            prompt += "  Recommendations:\n"
+            for rec in report.get("recommendations", []):
+                prompt += f"    • {rec}\n"
+            prompt += "  Supporting Evidence:\n"
+            for ev in report.get("supporting_evidence", []):
+                prompt += f"    • {ev}\n"
+        prompt += "\n"
+        
+        prompt += (
+            "Based ONLY on the specialist reports, construct a 4-point strategic brief with these exact elements:\n"
+            "1. Capital Allocation: Where to invest cash surplus or how to manage liquidity pressure.\n"
+            "2. Next Product Focus: Which product lines or raw materials to prioritize.\n"
+            "3. Cost Reductions: Where to trim operational waste or renegotiate supply terms.\n"
+            "4. Promotional Offers: How to engage customer segments or drive conversions.\n\n"
+            "For each of the 4 points, you MUST cite which specialist agent's report supported this decision (e.g. '[ProcurementAgent]', '[SupplierAgent]', '[CustomerAgent]', or '[OperationsAgent]'). Do not make up any facts outside the reports.\n\n"
+            "You MUST respond ONLY in valid, single-line-safe JSON matching this exact structure:\n"
+            "{\n"
+            '  "capital_allocation": "<Capital allocation strategy decision>",\n'
+            '  "next_product_focus": "<Product focus strategy decision>",\n'
+            '  "cost_reductions": "<Cost reductions strategy decision>",\n'
+            '  "promotional_offers": "<Promotional offers strategy>",\n'
+            '  "supporting_evidence": {\n'
+            '    "capital_allocation": "<citation details mentioning agent and evidence>",\n'
+            '    "next_product_focus": "<citation details>",\n'
+            '    "cost_reductions": "<citation details>",\n'
+            '    "promotional_offers": "<citation details>"\n'
+            '  }\n'
+            "}\n"
         )
         return prompt

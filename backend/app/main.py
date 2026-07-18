@@ -29,11 +29,16 @@ from app.database import Base, engine
 # Import all models so SQLAlchemy registers them before create_all
 import app.models.business  # noqa: F401
 import app.models.history   # noqa: F401
+import app.models.materials   # noqa: F401
+import app.models.supply_chain   # noqa: F401
+import app.models.collections   # noqa: F401
 
 # Routers — Phase 1
 from app.routers.business import router as business_router
 from app.routers.upload import router as upload_router
 from app.routers.dashboard import router as dashboard_router
+from app.routers.materials import router as materials_router
+from app.routers.supply_chain import router as supply_chain_router
 
 # Routers — Phase 2
 from app.routers.ai import router as ai_router
@@ -73,9 +78,46 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         await conn.run_sync(Base.metadata.create_all)
         logger.info("Database tables initialised.")
 
+        # Programmatic column addition for SQLite schemas updates
+        try:
+            cursor = await conn.execute("PRAGMA table_info(invoices)")
+            columns = await cursor.fetchall()
+            col_names = [col[1] for col in columns]
+            if "purchase_order_id" not in col_names:
+                logger.info("Migrating invoices table: adding purchase_order_id column")
+                await conn.execute("ALTER TABLE invoices ADD COLUMN purchase_order_id INTEGER REFERENCES purchase_orders(id) ON DELETE SET NULL")
+                logger.info("invoices table migrated successfully.")
+
+            cursor_cust = await conn.execute("PRAGMA table_info(customers)")
+            columns_cust = await cursor_cust.fetchall()
+            col_names_cust = [col[1] for col in columns_cust]
+            if "region" not in col_names_cust:
+                logger.info("Migrating customers table: adding region column")
+                await conn.execute("ALTER TABLE customers ADD COLUMN region VARCHAR(100) DEFAULT 'East'")
+                logger.info("customers table migrated successfully.")
+        except Exception as e:
+            logger.error("Lifespan database schema migration failed: %s", e)
+
+    # Start daily open invoice scanner background task
+    import asyncio
+    from app.database import AsyncSessionLocal
+    from app.services.collections_task import scan_open_invoices_periodically
+    
+    scanner_task = asyncio.create_task(
+        scan_open_invoices_periodically(AsyncSessionLocal, interval_seconds=86400)
+    )
+
     yield  # Application runs here
 
     logger.info("=== SME OS Shutting Down ===")
+    
+    # Cancel open invoice scanner task
+    scanner_task.cancel()
+    try:
+        await scanner_task
+    except asyncio.CancelledError:
+        pass
+        
     await engine.dispose()
     logger.info("Database connections closed.")
 
@@ -122,6 +164,8 @@ API_V1 = "/api/v1"
 app.include_router(business_router, prefix=API_V1)
 app.include_router(upload_router, prefix=API_V1)
 app.include_router(dashboard_router, prefix=API_V1)
+app.include_router(materials_router, prefix=API_V1)
+app.include_router(supply_chain_router, prefix=API_V1)
 
 # Phase 2 — AI Intelligence
 app.include_router(ai_router, prefix=API_V1)

@@ -147,3 +147,14 @@ class DecisionHistorySchema(OrmBase):
     outcome_revenue_impact: Optional[float]
     feedback: Optional[str]
     timestamp: datetime
+
+
+# ---------------------------------------------------------------------------
+# Strategic Growth (Phase 5)
+# ---------------------------------------------------------------------------
+class StrategyBrief(OrmBase):
+    capital_allocation: str
+    next_product_focus: str
+    cost_reductions: str
+    promotional_offers: str
+    supporting_evidence: Dict[str, str]  # citations of specialist findings

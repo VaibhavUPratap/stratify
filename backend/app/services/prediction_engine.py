@@ -207,6 +207,8 @@ class PredictionEngineService:
         """
         Multi-factor customer risk assessment: churn probability + late payment risk + CLV.
         """
+        from app.models.collections import PaymentHistory
+        
         customers = (await db.execute(select(Customer))).scalars().all()
         results = []
 
@@ -232,17 +234,41 @@ class PredictionEngineService:
 
             risk_label = "HIGH" if churn_prob > 0.50 else ("MEDIUM" if churn_prob > 0.25 else "LOW")
 
+            # Calculate 1-100 Collections Risk Score
+            base_credit_risk = clamp((850.0 - customer.credit_score) / 550.0 * 100.0, 0.0, 100.0)
+            
+            # Fetch payment history records
+            inv_ids = (await db.execute(select(Invoice.id).where(Invoice.customer_id == customer.id))).scalars().all()
+            if inv_ids:
+                histories = (await db.execute(select(PaymentHistory).where(PaymentHistory.invoice_id.in_(inv_ids)))).scalars().all()
+            else:
+                histories = []
+                
+            if histories:
+                late_payments = [h for h in histories if h.days_late > 0]
+                late_frequency = len(late_payments) / len(histories)
+                max_days_late = max(h.days_late for h in histories)
+                avg_days_late = sum(h.days_late for h in histories) / len(histories)
+                
+                late_risk = (late_frequency * 40.0) + (clamp(avg_days_late / 30.0, 0.0, 1.0) * 40.0) + (clamp(max_days_late / 90.0, 0.0, 1.0) * 20.0)
+                collections_score = (base_credit_risk * 0.4) + (late_risk * 0.6)
+            else:
+                collections_score = base_credit_risk
+                
+            collections_score = clamp(collections_score, 1.0, 100.0)
+
             results.append({
                 "customer_id": customer.id,
                 "name": customer.name,
                 "prediction": (
                     f"Churn Probability: {churn_prob:.0%} | "
                     f"Late Payment Risk: {late_payment_risk} | "
-                    f"Customer Risk: {risk_label}"
+                    f"Collections Risk Score: {collections_score:.0f}/100"
                 ),
                 "confidence_score": 0.85,
                 "churn_probability": round(churn_prob, 3),
                 "late_payment_risk": late_payment_risk,
+                "collections_risk_score": round(collections_score, 1),
                 "clv": customer.clv,
                 "important_features": ["credit_score", "customer_lifetime_value", "activity_status"],
                 "business_impact": (
@@ -259,6 +285,7 @@ class PredictionEngineService:
                     "credit_score": customer.credit_score,
                     "credit_limit": customer.credit_limit,
                     "risk_level": risk_label,
+                    "collections_risk_score": round(collections_score, 1),
                 },
             })
 
@@ -273,6 +300,9 @@ class PredictionEngineService:
         """
         Supplier risk: delivery delay probability, reliability trend, price increase risk.
         """
+        from datetime import datetime
+        from app.models.supply_chain import PurchaseOrder, TransportationLog
+
         suppliers = (await db.execute(select(Supplier))).scalars().all()
         results = []
 
@@ -288,6 +318,37 @@ class PredictionEngineService:
             )
 
             delay_ratio = safe_divide(supplier.total_delayed_orders, supplier.total_orders_placed, 0.0)
+
+            # 1. Invoice Payment Delay Analysis
+            ap_invoices = (await db.execute(
+                select(Invoice).where(
+                    Invoice.supplier_id == supplier.id,
+                    Invoice.invoice_type == "AP",
+                    Invoice.status.in_(["UNPAID", "PARTIAL", "OVERDUE"])
+                )
+            )).scalars().all()
+            
+            late_days = []
+            now_dt = datetime.utcnow()
+            for inv in ap_invoices:
+                if inv.due_date < now_dt:
+                    late_days.append((now_dt - inv.due_date).days)
+            invoice_delay = sum(late_days) / len(late_days) if late_days else 0.0
+
+            # 2. Transportation Margin Erosion Count
+            pos = (await db.execute(
+                select(PurchaseOrder).where(PurchaseOrder.supplier_id == supplier.id)
+            )).scalars().all()
+            
+            erosion_count = 0
+            for po in pos:
+                log = (await db.execute(
+                    select(TransportationLog).where(TransportationLog.purchase_order_id == po.id)
+                )).scalars().first()
+                if log:
+                    gross_margin = log.revenue_at_sale - (po.quantity * po.unit_cost)
+                    if gross_margin > 0 and (log.shipping_cost / gross_margin) > 0.3:
+                        erosion_count += 1
 
             results.append({
                 "supplier_id": supplier.id,
@@ -314,6 +375,8 @@ class PredictionEngineService:
                     "average_lead_days": supplier.average_lead_days,
                     "delay_rate": round(delay_ratio, 3),
                     "price_risk": price_risk,
+                    "invoice_delay": round(invoice_delay, 1),
+                    "margin_erosion_count": erosion_count,
                 },
             })
 

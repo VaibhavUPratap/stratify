@@ -8,7 +8,11 @@ import {
   getCustomerRisk, getSupplierRisk, getPricing,
   getDecisionHistory,
   uploadFile, uploadSampleDoc,
+  getMaterials, getProducts, createMaterial, updateMaterial,
+  deleteMaterial, getMaterialPriceHistory, createPriceHistory,
+  getMaterialForecast, getStrategyBrief,
 } from './api'
+import { OperationsHeatmap } from './components/OperationsHeatmap'
 import {
   LayoutDashboard,
   TrendingUp,
@@ -35,7 +39,7 @@ import {
 } from 'lucide-react'
 
 // ─── Types ────────────────────────────────────────────────────
-type Page = 'dashboard' | 'forecast' | 'risk' | 'agents' | 'simulate' | 'chat' | 'brief' | 'history' | 'upload'
+type Page = 'dashboard' | 'forecast' | 'risk' | 'agents' | 'simulate' | 'chat' | 'brief' | 'history' | 'upload' | 'materials' | 'strategy'
 
 // ─── Helpers ──────────────────────────────────────────────────
 const fmt = (n: number) =>
@@ -915,12 +919,354 @@ function ForecastPage() {
   )
 }
 
+// ─── Materials Page (Raw Materials & Pricing Engine) ──────────
+function MaterialsPage() {
+  const [materials, setMaterials] = useState<any[]>([])
+  const [products, setProducts] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+  const [editingId, setEditingId] = useState<number | null>(null)
+  
+  const [form, setForm] = useState({
+    name: '',
+    unit: '',
+    current_unit_price: '',
+    supplier_id: '',
+    reorder_threshold: '',
+    product_ids: [] as number[],
+  })
+  
+  const [forecastProduct, setForecastProduct] = useState('')
+  const [forecastLoading, setForecastLoading] = useState(false)
+  const [forecastResult, setForecastResult] = useState<any>(null)
+  const [histories, setHistories] = useState<Record<number, any[]>>({})
+
+  const loadData = useCallback(() => {
+    setLoading(true)
+    Promise.all([getMaterials(), getProducts()])
+      .then(async ([mRes, pRes]) => {
+        const mats = mRes.data
+        setMaterials(mats)
+        setProducts(pRes.data)
+        
+        const histMap: Record<number, any[]> = {}
+        for (const m of mats) {
+          try {
+            const hRes = await getMaterialPriceHistory(m.id)
+            histMap[m.id] = hRes.data
+          } catch (e) {
+            console.error(e)
+          }
+        }
+        setHistories(histMap)
+      })
+      .catch(err => console.error(err))
+      .finally(() => setLoading(false))
+  }, [])
+
+  useEffect(() => {
+    loadData()
+  }, [loadData])
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!form.name || !form.unit) return
+    const payload = {
+      name: form.name,
+      unit: form.unit,
+      current_unit_price: parseFloat(form.current_unit_price) || 0.0,
+      supplier_id: form.supplier_id ? parseInt(form.supplier_id) : null,
+      reorder_threshold: parseFloat(form.reorder_threshold) || 0.0,
+      product_ids: form.product_ids
+    }
+    
+    try {
+      if (editingId) {
+        await updateMaterial(editingId, payload)
+      } else {
+        await createMaterial(payload)
+      }
+      setForm({ name: '', unit: '', current_unit_price: '', supplier_id: '', reorder_threshold: '', product_ids: [] })
+      setEditingId(null)
+      loadData()
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
+  const handleEdit = (m: any) => {
+    setEditingId(m.id)
+    setForm({
+      name: m.name,
+      unit: m.unit,
+      current_unit_price: String(m.current_unit_price),
+      supplier_id: m.supplier_id ? String(m.supplier_id) : '',
+      reorder_threshold: String(m.reorder_threshold),
+      product_ids: m.product_ids || []
+    })
+  }
+
+  const handleDelete = async (id: number) => {
+    if (!window.confirm('Delete this material?')) return
+    try {
+      await deleteMaterial(id)
+      loadData()
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
+  const handleForecast = async () => {
+    if (!forecastProduct) return
+    setForecastLoading(true)
+    try {
+      const res = await getMaterialForecast(parseInt(forecastProduct))
+      setForecastResult(res.data)
+    } catch (err) {
+      console.error(err)
+    } finally {
+      setForecastLoading(false)
+    }
+  }
+
+  const handleAddPriceHistory = async (materialId: number, currentPrice: number) => {
+    const newPriceStr = window.prompt(`Log new price for this material (Current: $${currentPrice}):`, String(currentPrice))
+    if (!newPriceStr) return
+    const newPrice = parseFloat(newPriceStr)
+    if (isNaN(newPrice) || newPrice < 0) {
+      alert('Invalid price value')
+      return
+    }
+    try {
+      await createPriceHistory({
+        material_id: materialId,
+        recorded_price: newPrice,
+        source: 'MANUAL'
+      })
+      loadData()
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
+  if (loading) {
+    return <div className="page-body"><div className="card reveal"><div className="empty-state">Loading materials engine...</div></div></div>
+  }
+
+  return (
+    <div className="page-body">
+      <div className="bento-grid">
+        {/* Left column: Raw Materials list & Add Form */}
+        <div className="col-7 card reveal" style={{ '--i': 0 } as any}>
+          <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div>
+              <div className="card-title">Raw Material Stock Ledger</div>
+              <div className="card-subtitle">Track raw resources, spot pricing, and product allocations</div>
+            </div>
+          </div>
+          
+          {materials.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon"><Activity size={32} /></div>
+              <h3>No Materials Logged</h3>
+              <p>Initialize raw material records below to track spot price fluctuations.</p>
+            </div>
+          ) : (
+            <table className="data-table" style={{ width: '100%' }}>
+              <thead>
+                <tr>
+                  <th>Material</th>
+                  <th>Spot Price</th>
+                  <th>Trend (90d)</th>
+                  <th>Reorder Point</th>
+                  <th>Linked Products</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {materials.map(m => {
+                  const histList = histories[m.id] || []
+                  const prices = histList.map((h: any) => h.recorded_price).reverse()
+                  if (prices.length === 0 || prices[prices.length - 1] !== m.current_unit_price) {
+                    prices.push(m.current_unit_price)
+                  }
+                  
+                  return (
+                    <tr key={m.id}>
+                      <td>
+                        <strong>{m.name}</strong>
+                        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-ink-2)' }}>Unit: {m.unit}</div>
+                      </td>
+                      <td>
+                        <span style={{ fontFamily: 'var(--font-mono)' }}>${m.current_unit_price.toFixed(2)}</span>
+                      </td>
+                      <td>
+                        {prices.length > 1 ? (
+                          <Sparkline data={prices} color="var(--color-success)" />
+                        ) : (
+                          <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-muted)' }}>Stable</span>
+                        )}
+                      </td>
+                      <td>{m.reorder_threshold} {m.unit}</td>
+                      <td>
+                        <span className="badge info">{m.product_ids?.length || 0} Products</span>
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                          <button className="badge amber" style={{ border: 'none', cursor: 'pointer' }} onClick={() => handleEdit(m)}>Edit</button>
+                          <button className="badge green" style={{ border: 'none', cursor: 'pointer' }} onClick={() => handleAddPriceHistory(m.id, m.current_unit_price)}>+ Price</button>
+                          <button className="badge red" style={{ border: 'none', cursor: 'pointer' }} onClick={() => handleDelete(m.id)}>Delete</button>
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+
+          {/* Form */}
+          <div style={{ borderTop: '1px solid var(--color-rule-2)', marginTop: '20px', paddingTop: '20px' }}>
+            <h3 style={{ marginBottom: '15px' }}>{editingId ? 'Edit Raw Material' : 'Log New Raw Material'}</h3>
+            <form onSubmit={handleSave}>
+              <div className="form-grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
+                <div className="form-group">
+                  <label className="form-label">Material Name</label>
+                  <input className="form-input" type="text" placeholder="e.g., Steel Sheet" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} required />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Measurement Unit</label>
+                  <input className="form-input" type="text" placeholder="e.g., kg, unit, liter" value={form.unit} onChange={e => setForm({ ...form, unit: e.target.value })} required />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Current Spot Price ($)</label>
+                  <input className="form-input" type="number" step="0.01" placeholder="0.00" value={form.current_unit_price} onChange={e => setForm({ ...form, current_unit_price: e.target.value })} />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Reorder Threshold</label>
+                  <input className="form-input" type="number" step="0.1" placeholder="e.g., 50" value={form.reorder_threshold} onChange={e => setForm({ ...form, reorder_threshold: e.target.value })} />
+                </div>
+                <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                  <label className="form-label">Associate with Product Catalog SKUs</label>
+                  <select 
+                    multiple 
+                    className="form-input" 
+                    style={{ height: '100px', background: 'var(--color-paper-3)' }} 
+                    value={form.product_ids.map(String)} 
+                    onChange={e => {
+                      const selected = Array.from(e.target.selectedOptions, option => parseInt(option.value))
+                      setForm({ ...form, product_ids: selected })
+                    }}
+                  >
+                    {products.map(p => (
+                      <option key={p.id} value={p.id}>{p.name} ({p.sku})</option>
+                    ))}
+                  </select>
+                  <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-ink-2)' }}>Hold Ctrl (Cmd) to select multiple products.</span>
+                </div>
+              </div>
+              <div style={{ marginTop: '15px', display: 'flex', gap: '10px' }}>
+                <button type="submit" className="theme-toggle" style={{ background: 'var(--color-accent)', color: 'var(--color-accent-ink)', padding: '8px 16px', borderRadius: 'var(--radius-button)', border: 'none', cursor: 'pointer' }}>
+                  {editingId ? 'Apply Update' : 'Register Material'}
+                </button>
+                {editingId && (
+                  <button type="button" className="theme-toggle" style={{ padding: '8px 16px', borderRadius: 'var(--radius-button)', border: 'none', cursor: 'pointer' }} onClick={() => {
+                    setEditingId(null)
+                    setForm({ name: '', unit: '', current_unit_price: '', supplier_id: '', reorder_threshold: '', product_ids: [] })
+                  }}>
+                    Cancel
+                  </button>
+                )}
+              </div>
+            </form>
+          </div>
+        </div>
+
+        {/* Right column: Margin Forecast Simulator */}
+        <div className="col-5 card reveal" style={{ '--i': 1 } as any}>
+          <div className="card-header">
+            <div>
+              <div className="card-title">Material-Linked Margin Forecast</div>
+              <div className="card-subtitle">Project product profit margins derived from raw material price shifts</div>
+            </div>
+          </div>
+          
+          <div className="form-group" style={{ marginBottom: '20px' }}>
+            <label className="form-label">Select Product to Run Projection</label>
+            <select className="form-input" style={{ background: 'var(--color-paper-3)' }} value={forecastProduct} onChange={e => setForecastProduct(e.target.value)}>
+              <option value="">-- Choose Product --</option>
+              {products.map(p => (
+                <option key={p.id} value={p.id}>{p.name} (Price: ${p.price.toFixed(2)})</option>
+              ))}
+            </select>
+          </div>
+          
+          <button 
+            className="theme-toggle" 
+            style={{ width: '100%', padding: '12px', background: 'var(--color-accent)', color: 'var(--color-accent-ink)', borderRadius: 'var(--radius-button)', border: 'none', cursor: 'pointer' }} 
+            onClick={handleForecast}
+            disabled={!forecastProduct || forecastLoading}
+          >
+            {forecastLoading ? 'Calculating Margins...' : 'Run Margin Forecast'}
+          </button>
+          
+          {forecastResult && (
+            <div style={{ marginTop: '25px', padding: '15px', border: '1px solid var(--color-rule)', borderRadius: 'var(--radius-card)', background: 'var(--color-paper-2)' }}>
+              <h4 style={{ marginBottom: '15px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Sparkles size={16} /> Margins Projection Results
+              </h4>
+              
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px dashed var(--color-rule-2)', paddingBottom: '6px' }}>
+                  <span style={{ color: 'var(--color-ink-2)' }}>Product SKU:</span>
+                  <strong>{forecastResult.sku}</strong>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px dashed var(--color-rule-2)', paddingBottom: '6px' }}>
+                  <span style={{ color: 'var(--color-ink-2)' }}>Selling Price:</span>
+                  <strong>${forecastResult.price.toFixed(2)}</strong>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px dashed var(--color-rule-2)', paddingBottom: '6px' }}>
+                  <span style={{ color: 'var(--color-ink-2)' }}>Original COGS:</span>
+                  <strong>${forecastResult.original_cogs.toFixed(2)}</strong>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px dashed var(--color-rule-2)', paddingBottom: '6px' }}>
+                  <span style={{ color: 'var(--color-ink-2)' }}>Projected COGS:</span>
+                  <strong style={{ color: forecastResult.projected_cogs > forecastResult.original_cogs ? 'var(--color-error)' : 'var(--color-success)' }}>
+                    ${forecastResult.projected_cogs.toFixed(2)}
+                  </strong>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px dashed var(--color-rule-2)', paddingBottom: '6px' }}>
+                  <span style={{ color: 'var(--color-ink-2)' }}>Original Gross Margin:</span>
+                  <strong>{(forecastResult.original_margin * 100).toFixed(1)}%</strong>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', paddingBottom: '6px' }}>
+                  <span style={{ color: 'var(--color-ink-2)' }}>Projected Gross Margin:</span>
+                  <strong style={{ fontSize: 'var(--text-md)', color: forecastResult.projected_margin < forecastResult.original_margin ? 'var(--color-error)' : 'var(--color-success)' }}>
+                    {(forecastResult.projected_margin * 100).toFixed(1)}%
+                  </strong>
+                </div>
+              </div>
+              
+              {forecastResult.projected_margin < forecastResult.original_margin && (
+                <div className="alert-banner warning" style={{ marginTop: '15px', padding: '10px', fontSize: 'var(--text-xs)' }}>
+                  ⚠ Margin erosion detected! Raw materials spot prices exceed the current product production cost. Consider raising product selling price or renegotiating with suppliers.
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── Risk Page (Tabular Console) ──────────────────────────────
 function RiskPage() {
   const [customers, setCustomers] = useState<any[]>([])
   const [suppliers, setSuppliers] = useState<any[]>([])
   const [pricing, setPricing] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [sortBy, setSortBy] = useState<'churn' | 'collections'>('churn')
+  const [filterBy, setFilterBy] = useState<'all' | 'high_collections'>('all')
 
   useEffect(() => {
     Promise.all([getCustomerRisk(), getSupplierRisk(), getPricing()])
@@ -936,21 +1282,59 @@ function RiskPage() {
     return <span className={`badge ${label}`}>{r}</span>
   }
 
+  const processedCustomers = customers
+    .filter(c => {
+      if (filterBy === 'high_collections') {
+        return (c.collections_risk_score ?? 0) > 70
+      }
+      return true
+    })
+    .sort((a, b) => {
+      if (sortBy === 'collections') {
+        return (b.collections_risk_score ?? 0) - (a.collections_risk_score ?? 0)
+      }
+      return (b.churn_probability ?? 0) - (a.churn_probability ?? 0)
+    })
+
   return (
     <div className="page-body">
       {/* Customer Risk Registry */}
       <div className="card reveal" style={{ '--i': 0 } as any}>
-        <div className="card-header">
+        <div className="card-header" style={{ flexWrap: 'wrap', gap: '16px' }}>
           <div>
             <div className="card-title">Customer Portfolio Risk Telemetry</div>
-            <div className="card-subtitle">{customers.length} ledger instances analyzed</div>
+            <div className="card-subtitle">{processedCustomers.length} ledger instances analyzed</div>
+          </div>
+          <div style={{ display: 'flex', gap: '12px', marginLeft: 'auto' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ fontSize: '0.75rem', color: 'var(--color-muted)' }}>Sort:</span>
+              <select 
+                value={sortBy} 
+                onChange={(e) => setSortBy(e.target.value as any)}
+                style={{ background: 'var(--color-paper-2)', color: 'var(--color-ink)', border: '1px solid var(--color-rule)', borderRadius: '4px', padding: '4px 8px', fontSize: '0.75rem' }}
+              >
+                <option value="churn">Churn Risk Index</option>
+                <option value="collections">Collections Risk</option>
+              </select>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ fontSize: '0.75rem', color: 'var(--color-muted)' }}>Filter:</span>
+              <select 
+                value={filterBy} 
+                onChange={(e) => setFilterBy(e.target.value as any)}
+                style={{ background: 'var(--color-paper-2)', color: 'var(--color-ink)', border: '1px solid var(--color-rule)', borderRadius: '4px', padding: '4px 8px', fontSize: '0.75rem' }}
+              >
+                <option value="all">Show All</option>
+                <option value="high_collections">High Collections Risk (&gt;70)</option>
+              </select>
+            </div>
           </div>
         </div>
-        {customers.length === 0 ? (
+        {processedCustomers.length === 0 ? (
           <div className="empty-state">
             <div className="empty-icon"><Users size={32} /></div>
             <h3>No Customer Nodes</h3>
-            <p>Database table is empty. Register customers to initiate matrix.</p>
+            <p>No customer records match the current filter selection.</p>
           </div>
         ) : (
           <table className="data-table">
@@ -959,12 +1343,13 @@ function RiskPage() {
                 <th>Customer Node</th>
                 <th>Churn Risk Index</th>
                 <th>Receivables Risk</th>
+                <th>Collections Risk</th>
                 <th>Lifetime Capital (CLV)</th>
                 <th>Automated Action Recommendation</th>
               </tr>
             </thead>
             <tbody>
-              {customers.map((c, i) => (
+              {processedCustomers.map((c, i) => (
                 <tr key={i}>
                   <td style={{ fontWeight: 600, color: 'var(--color-ink)' }}>{c.name}</td>
                   <td style={{ fontFamily: 'var(--font-mono)' }}>
@@ -972,6 +1357,13 @@ function RiskPage() {
                     <span style={{ marginLeft: '8px', color: 'var(--color-muted)' }}>{pct(c.churn_probability)}</span>
                   </td>
                   <td>{riskBadge(c.late_payment_risk)}</td>
+                  <td style={{ fontFamily: 'var(--font-mono)', fontWeight: 600 }}>
+                    {c.collections_risk_score !== undefined ? (
+                      <span style={{ color: c.collections_risk_score > 70 ? 'var(--color-error)' : c.collections_risk_score > 40 ? 'var(--color-warning)' : 'var(--color-success)' }}>
+                        {c.collections_risk_score.toFixed(0)}/100
+                      </span>
+                    ) : '—'}
+                  </td>
                   <td style={{ color: 'var(--color-success)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>{fmt(c.clv ?? 0)}</td>
                   <td style={{ fontSize: '0.72rem', color: 'var(--color-ink-2)', maxWidth: '300px' }}>{c.suggested_action}</td>
                 </tr>
@@ -1004,6 +1396,8 @@ function RiskPage() {
                 <th>Telemetry Reliability</th>
                 <th>Mean Lead Duration</th>
                 <th>Market Price Risk</th>
+                <th>Payment Delay (Avg)</th>
+                <th>Margin Erosion</th>
               </tr>
             </thead>
             <tbody>
@@ -1025,6 +1419,8 @@ function RiskPage() {
                   </td>
                   <td style={{ fontFamily: 'var(--font-mono)' }}>{s.metadata?.average_lead_days ?? '—'} days</td>
                   <td>{riskBadge(s.metadata?.price_risk ?? 'LOW')}</td>
+                  <td style={{ fontFamily: 'var(--font-mono)' }}>{s.metadata?.invoice_delay ? `${s.metadata.invoice_delay} days` : '0 days'}</td>
+                  <td>{s.metadata?.margin_erosion_count ? <span className="badge red">{s.metadata.margin_erosion_count} Shipments</span> : <span className="badge green">None</span>}</td>
                 </tr>
               ))}
             </tbody>
@@ -1118,34 +1514,51 @@ function AgentsPage() {
       {loading && <AgentsPageSkeleton />}
 
       {ran && !loading && (
-        <div className="agent-grid">
-          {agents.map((a, idx) => {
-            const meta = AGENT_META[a.agent_name] ?? { icon: '🤖', color: 'rgba(99,179,237,0.08)', border: 'var(--color-accent)' }
-            const rc = riskColor(a.risk_level)
-            return (
-              <div className="agent-card reveal" key={idx} style={{ '--i': idx + 1 } as any}>
-                <div className="agent-header">
-                  <div className="agent-avatar" style={{ '--agent-color': meta.color } as any}>{meta.icon}</div>
-                  <div>
-                    <div className="agent-name">{a.agent_name}</div>
-                    <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }}>
-                      <span className="badge" style={{ background: `${rc}12`, color: rc, borderColor: `${rc}25` }}>{a.risk_level}</span>
-                      <span className="badge blue">Confidence: {pct(a.confidence)}</span>
-                    </div>
-                  </div>
-                </div>
-                <div className="agent-analysis">{a.analysis}</div>
-                <div className="agent-recs">
-                  {(a.recommendations ?? []).map((r: string, j: number) => (
-                    <div className="agent-rec" key={j} style={{ '--agent-border': meta.border } as any}>
-                      {r}
-                    </div>
-                  ))}
+        <>
+          {/* Operations Geographic Heatmap */}
+          {agents.find(a => a.agent_name === 'OperationsAgent')?.geographic_sales_density && (
+            <div className="card reveal" style={{ '--i': 1, marginBottom: '24px' } as any}>
+              <div className="card-header">
+                <div>
+                  <div className="card-title">Geographic Sales Density & Staffing Optimizer</div>
+                  <div className="card-subtitle">Real-time telemetry parsed from customer regional mapping data</div>
                 </div>
               </div>
-            )
-          })}
-        </div>
+              <div style={{ padding: '20px' }}>
+                <OperationsHeatmap data={agents.find(a => a.agent_name === 'OperationsAgent').geographic_sales_density} />
+              </div>
+            </div>
+          )}
+
+          <div className="agent-grid">
+            {agents.map((a, idx) => {
+              const meta = AGENT_META[a.agent_name] ?? { icon: '🤖', color: 'rgba(99,179,237,0.08)', border: 'var(--color-accent)' }
+              const rc = riskColor(a.risk_level)
+              return (
+                <div className="agent-card reveal" key={idx} style={{ '--i': idx + 1 } as any}>
+                  <div className="agent-header">
+                    <div className="agent-avatar" style={{ '--agent-color': meta.color } as any}>{meta.icon}</div>
+                    <div>
+                      <div className="agent-name">{a.agent_name}</div>
+                      <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }}>
+                        <span className="badge" style={{ background: `${rc}12`, color: rc, borderColor: `${rc}25` }}>{a.risk_level}</span>
+                        <span className="badge blue">Confidence: {pct(a.confidence)}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="agent-analysis">{a.analysis}</div>
+                  <div className="agent-recs">
+                    {(a.recommendations ?? []).map((r: string, j: number) => (
+                      <div className="agent-rec" key={j} style={{ '--agent-border': meta.border } as any}>
+                        {r}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </>
       )}
     </div>
   )
@@ -1632,6 +2045,154 @@ function BriefPage() {
   )
 }
 
+// ─── CEO Strategic Growth Brief ───────────────────────────────
+function CEOStrategicDashboard() {
+  const [brief, setBrief] = useState<any>(null)
+  const [loading, setLoading] = useState(false)
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
+
+  const fetch = async () => {
+    setLoading(true)
+    try {
+      const r = await getStrategyBrief()
+      setBrief(r.data)
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    fetch()
+  }, [])
+
+  const toggleExpand = (key: string) => {
+    setExpanded(prev => ({ ...prev, [key]: !prev[key] }))
+  }
+
+  if (loading) return <BriefPageSkeleton />
+
+  return (
+    <div className="page-body">
+      <div className="card reveal" style={{ '--i': 0 } as any}>
+        <div className="card-header">
+          <div>
+            <div className="card-title">CEO Strategic Growth Dashboard</div>
+            <div className="card-subtitle">Synthesized executive consensus briefing citing specialist node justifications</div>
+          </div>
+          <button className="btn btn-primary" onClick={fetch} disabled={loading}>
+            {loading ? <><div className="spinner" /> Synthesizing Strategy…</> : <><Sparkles size={14} /> Refresh Strategic Brief</>}
+          </button>
+        </div>
+        {!brief && !loading && (
+          <div className="empty-state" style={{ padding: 'var(--space-xl) 0' }}>
+            <div className="empty-icon" style={{ color: 'var(--color-accent)' }}><Bot size={40} /></div>
+            <h3>Strategic Dashboard Ready</h3>
+            <p>Generate strategy brief to synthesize corporate growth targets.</p>
+          </div>
+        )}
+      </div>
+
+      {brief && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+          {[
+            {
+              key: 'capital_allocation',
+              title: 'Capital Allocation Strategy',
+              emoji: '💼',
+              content: brief.capital_allocation,
+              evidence: brief.supporting_evidence?.capital_allocation || 'Derived from current liquidity metrics.'
+            },
+            {
+              key: 'next_product_focus',
+              title: 'Next Product & Raw Materials Focus',
+              emoji: '📦',
+              content: brief.next_product_focus,
+              evidence: brief.supporting_evidence?.next_product_focus || 'Derived from procurement cost fluctuations.'
+            },
+            {
+              key: 'cost_reductions',
+              title: 'Operational Cost Reductions',
+              emoji: '📉',
+              content: brief.cost_reductions,
+              evidence: brief.supporting_evidence?.cost_reductions || 'Derived from supply chain overhead reports.'
+            },
+            {
+              key: 'promotional_offers',
+              title: 'Strategic Promotional Offers',
+              emoji: '🎯',
+              content: brief.promotional_offers,
+              evidence: brief.supporting_evidence?.promotional_offers || 'Derived from customer cohort analysis.'
+            }
+          ].map((card, idx) => {
+            const isExpanded = !!expanded[card.key]
+            return (
+              <div 
+                className="card reveal" 
+                key={card.key} 
+                style={{ 
+                  '--i': idx + 1, 
+                  display: 'flex', 
+                  flexDirection: 'column', 
+                  justifyContent: 'space-between',
+                  padding: '20px' 
+                } as any}
+              >
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+                    <span style={{ fontSize: '1.5rem' }}>{card.emoji}</span>
+                    <h3 style={{ margin: 0, fontSize: '1.05rem', fontWeight: 700, color: 'var(--color-ink)' }}>{card.title}</h3>
+                  </div>
+                  <p style={{ fontSize: '0.85rem', color: 'var(--color-ink-2)', lineHeight: 1.6, marginBottom: '16px' }}>
+                    {card.content}
+                  </p>
+                </div>
+                
+                <div style={{ marginTop: 'auto', borderTop: '1px solid var(--color-rule-2)', paddingTop: '12px' }}>
+                  <button 
+                    onClick={() => toggleExpand(card.key)}
+                    style={{ 
+                      display: 'flex', 
+                      alignItems: 'center', 
+                      gap: '6px', 
+                      background: 'none', 
+                      border: 'none', 
+                      color: 'var(--color-accent)', 
+                      fontSize: '0.72rem', 
+                      fontWeight: 600, 
+                      cursor: 'pointer',
+                      padding: 0
+                    }}
+                  >
+                    {isExpanded ? 'Hide Supporting Evidence' : 'Show Supporting Evidence & Citations'}
+                  </button>
+                  {isExpanded && (
+                    <div 
+                      style={{ 
+                        marginTop: '10px', 
+                        padding: '10px 12px', 
+                        background: 'var(--color-paper-3)', 
+                        borderLeft: '3px solid var(--color-accent)',
+                        borderRadius: '4px',
+                        fontSize: '0.72rem', 
+                        color: 'var(--color-ink-2)',
+                        lineHeight: 1.5
+                      }}
+                    >
+                      {card.evidence}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Decision History Page ────────────────────────────────────
 function HistoryPage() {
   const [history, setHistory] = useState<any[]>([])
@@ -1881,7 +2442,9 @@ function UploadPage() {
 // Nav definitions with Lucide Icons
 const NAV_CLEAN = [
   { id: 'dashboard' as Page, label: 'Telemetry Dashboard', icon: <LayoutDashboard size={16} />, section: 'Overview' },
+  { id: 'materials' as Page, label: 'Raw Materials', icon: <Activity size={16} />, section: undefined },
   { id: 'brief' as Page, label: 'Executive Brief', icon: <FileText size={16} />, section: undefined },
+  { id: 'strategy' as Page, label: 'Strategic Brief', icon: <TrendingUp size={16} />, section: undefined },
   { id: 'forecast' as Page, label: 'Predictive Forecast', icon: <TrendingUp size={16} />, section: 'Intelligence' },
   { id: 'risk' as Page, label: 'Risk & Pricing', icon: <ShieldAlert size={16} />, section: undefined },
   { id: 'agents' as Page, label: 'AI Agents Grid', icon: <Bot size={16} />, section: undefined },
@@ -1893,12 +2456,14 @@ const NAV_CLEAN = [
 
 const PAGE_TITLES: Record<Page, string> = {
   dashboard: 'Operations Telemetry Dashboard',
+  materials: 'Raw Materials & Pricing Engine',
   forecast: 'Predictive Forecasting Module',
   risk: 'Risk & Pricing Optimisation',
   agents: 'Multi-Agent Network Engine',
   simulate: 'Digital Twin Simulation Console',
   chat: 'AI Core Conversation',
   brief: 'Morning Executive Brief',
+  strategy: 'CEO Strategic Growth Brief',
   history: 'Decision Execution Registry',
   upload: 'Automated Document Ingestion Console',
 }
@@ -1929,12 +2494,14 @@ export default function App() {
   const renderPage = () => {
     switch (page) {
       case 'dashboard': return <DashboardPage />
+      case 'materials': return <MaterialsPage />
       case 'forecast': return <ForecastPage />
       case 'risk': return <RiskPage />
       case 'agents': return <AgentsPage />
       case 'simulate': return <SimulatePage />
       case 'chat': return <ChatPage />
       case 'brief': return <BriefPage />
+      case 'strategy': return <CEOStrategicDashboard />
       case 'history': return <HistoryPage />
       case 'upload': return <UploadPage />
     }

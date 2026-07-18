@@ -56,6 +56,90 @@ class BaseAgent:
 
 
 # ============================================================
+# Procurement Agent
+# ============================================================
+
+class ProcurementAgent(BaseAgent):
+    """Analyses raw material cost trends, price history, and purchasing timing."""
+
+    name = "ProcurementAgent"
+    role = "Chief Procurement & Raw Materials Intelligence"
+    focus = "Raw material spot pricing, cost forecasting, price trend analysis, and stockpile/delay decisions"
+
+    async def analyse(
+        self,
+        db: AsyncSession,
+        context: Dict[str, Any],
+        predictions: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        from app.services.ollama_client import OllamaClient
+        
+        prompt = PromptBuilder.build_procurement_agent_prompt(context)
+        
+        # Build raw data context for fallback
+        material_history = context.get("material_price_history", [])
+        
+        try:
+            res = await OllamaClient.chat_json(prompt)
+            if "analysis" in res and "recommendations" in res:
+                return {
+                    "agent_name": self.name,
+                    "analysis": res["analysis"],
+                    "recommendations": res["recommendations"][:4],
+                    "confidence": round(float(res.get("confidence", 0.85)), 2),
+                    "risk_level": res.get("risk_level", "MEDIUM"),
+                    "supporting_evidence": res.get("supporting_evidence", [])[:4],
+                }
+        except Exception as exc:
+            logger.warning("Ollama backend unavailable for ProcurementAgent (%s) — serving fallback analysis.", exc)
+            
+        # Robust Python heuristic fallback
+        recs = []
+        evidence = []
+        risk_level = "LOW"
+        
+        for item in material_history:
+            name = item["name"]
+            curr_price = item["current_price"]
+            histories = item.get("history", [])
+            
+            if histories:
+                avg_price = sum(h["recorded_price"] for h in histories) / len(histories)
+                price_diff_pct = (curr_price - avg_price) / (avg_price or 1.0)
+                
+                if price_diff_pct < -0.05:
+                    rec = f"{name}: STOCKPILE - Spot price (${curr_price:.2f}) is lower than historical average (${avg_price:.2f}), suggesting stockpile."
+                    recs.append(rec)
+                    evidence.append(f"{name} spot ${curr_price:.2f} vs avg ${avg_price:.2f}")
+                elif price_diff_pct > 0.05:
+                    rec = f"{name}: DELAY - Spot price (${curr_price:.2f}) is higher than historical average (${avg_price:.2f}), suggesting delay."
+                    recs.append(rec)
+                    evidence.append(f"{name} spot ${curr_price:.2f} vs avg ${avg_price:.2f}")
+                    risk_level = "MEDIUM"
+                else:
+                    rec = f"{name}: HOLD - Spot price (${curr_price:.2f}) is close to historical average (${avg_price:.2f}), suggesting hold."
+                    recs.append(rec)
+                    evidence.append(f"{name} spot ${curr_price:.2f} stable with avg ${avg_price:.2f}")
+            else:
+                recs.append(f"{name}: HOLD - Spot price is ${curr_price:.2f} (no history available).")
+                evidence.append(f"{name} spot is ${curr_price:.2f}")
+                
+        analysis_str = f"Procurement status: Checked {len(material_history)} raw materials. Spot prices and trailing trends analysed."
+        if not material_history:
+            analysis_str = "Procurement status: No raw materials logged in the system."
+            recs.append("Add raw materials with historical pricing to enable automated timing analysis.")
+            
+        return {
+            "agent_name": self.name,
+            "analysis": analysis_str,
+            "recommendations": recs[:4],
+            "confidence": 0.90,
+            "risk_level": risk_level,
+            "supporting_evidence": evidence[:4],
+        }
+
+
+# ============================================================
 # Finance Agent
 # ============================================================
 
@@ -158,6 +242,9 @@ class OperationsAgent(BaseAgent):
         context: Dict[str, Any],
         predictions: Dict[str, Any],
     ) -> Dict[str, Any]:
+        from app.models.business import Customer, Sales
+        from sqlalchemy import func
+
         low_stock = context.get("low_stock_products", [])
         risky_suppliers = context.get("risky_suppliers", [])
 
@@ -169,9 +256,35 @@ class OperationsAgent(BaseAgent):
         recs = []
         evidence = []
 
+        # Geographic sales density analysis
+        regions = ["East", "West", "North", "South"]
+        density_data = {}
+        for r_name in regions:
+            vol_stmt = select(func.sum(Sales.total_price)).join(Customer).where(Customer.region == r_name)
+            sales_volume = (await db.execute(vol_stmt)).scalar() or 0.0
+            
+            count_stmt = select(func.count(Sales.id)).join(Customer).where(Customer.region == r_name)
+            tx_count = (await db.execute(count_stmt)).scalar() or 0
+            
+            trend = "GROWING" if tx_count > 5 else "STABLE"
+            staffing = "INCREASE" if sales_volume > 5000 else "OPTIMAL"
+            marketing = "HIGH" if sales_volume < 2000 else "LOW"
+            
+            density_data[r_name] = {
+                "sales_volume": float(sales_volume),
+                "sales_count": int(tx_count),
+                "demand_trend": trend,
+                "staffing_recommendation": staffing,
+                "marketing_priority": marketing
+            }
+            if marketing == "HIGH" and sales_volume > 0:
+                recs.append(f"Geographic opportunity: Region '{r_name}' sales volume is underperforming (${sales_volume:,.0f}). Raise marketing budget.")
+                evidence.append(f"Region '{r_name}' sales underperforming")
+
         if out_of_stock > 0:
             recs.append(f"CRITICAL: {out_of_stock} SKU(s) are completely out of stock — expedite reorders immediately.")
-            evidence.append(f"{out_of_stock}/{total_products} SKUs at zero stock")
+            if f"{out_of_stock}/{total_products} SKUs at zero stock" not in evidence:
+                evidence.append(f"{out_of_stock}/{total_products} SKUs at zero stock")
 
         if low_stock:
             recs.append(
@@ -206,6 +319,7 @@ class OperationsAgent(BaseAgent):
             "confidence": 0.88,
             "risk_level": "CRITICAL" if out_of_stock > 2 else ("HIGH" if low_stock else "LOW"),
             "supporting_evidence": evidence,
+            "geographic_sales_density": density_data,
         }
 
 
@@ -291,6 +405,9 @@ class SupplierAgent(BaseAgent):
         context: Dict[str, Any],
         predictions: Dict[str, Any],
     ) -> Dict[str, Any]:
+        from datetime import datetime
+        from app.models.supply_chain import PurchaseOrder, TransportationLog
+
         suppliers = (await db.execute(select(Supplier))).scalars().all()
         supplier_risk = predictions.get("supplier_risk", [])
 
@@ -302,10 +419,55 @@ class SupplierAgent(BaseAgent):
         recs = []
         evidence = []
 
+        # 1. Invoice Payment Delay Analysis (days-late average per supplier)
+        supplier_delays = {}
+        for s in suppliers:
+            ap_stmt = select(Invoice).where(
+                Invoice.supplier_id == s.id,
+                Invoice.invoice_type == "AP",
+                Invoice.status.in_(["UNPAID", "PARTIAL", "OVERDUE"])
+            )
+            ap_invoices = (await db.execute(ap_stmt)).scalars().all()
+            
+            late_days = []
+            now_dt = datetime.utcnow()
+            for inv in ap_invoices:
+                if inv.due_date < now_dt:
+                    late_days.append((now_dt - inv.due_date).days)
+            
+            avg_late = sum(late_days) / len(late_days) if late_days else 0.0
+            supplier_delays[s.id] = avg_late
+            if avg_late > 10.0:
+                recs.append(f"Supplier '{s.name}' has AP invoice payment delay averaging {avg_late:.1f} days. Adjust cash allocation priority.")
+                evidence.append(f"AP invoice delay for {s.name}: {avg_late:.1f} days avg")
+
+        # 2. Transportation Margin Erosion Detection
+        supplier_erosion_count = {}
+        for s in suppliers:
+            po_stmt = select(PurchaseOrder).where(PurchaseOrder.supplier_id == s.id)
+            pos = (await db.execute(po_stmt)).scalars().all()
+            
+            erosion_shipments = 0
+            for po in pos:
+                log_stmt = select(TransportationLog).where(TransportationLog.purchase_order_id == po.id)
+                log = (await db.execute(log_stmt)).scalars().first()
+                if log:
+                    gross_margin = log.revenue_at_sale - (po.quantity * po.unit_cost)
+                    if gross_margin > 0:
+                        erosion_pct = (log.shipping_cost / gross_margin) * 100
+                        if erosion_pct > 30.0:
+                            erosion_shipments += 1
+                            
+            supplier_erosion_count[s.id] = erosion_shipments
+            if erosion_shipments > 0:
+                recs.append(f"Supplier '{s.name}' flagged: {erosion_shipments} shipment(s) with transport cost consuming >30% of margin.")
+                evidence.append(f"Margin erosion for {s.name}: {erosion_shipments} shipments")
+
         if high_risk:
             names = [s["name"] for s in high_risk[:3]]
             recs.append(f"HIGH RISK: {len(high_risk)} supplier(s) flagged ({', '.join(names)}). Activate backup vendor protocol.")
-            evidence.append(f"High-risk suppliers: {names}")
+            if f"High-risk suppliers: {names}" not in evidence:
+                evidence.append(f"High-risk suppliers: {names}")
 
         if avg_reliability < 0.80:
             recs.append(
@@ -319,16 +481,24 @@ class SupplierAgent(BaseAgent):
 
         recs.append("Negotiate fixed-price contracts with strategic suppliers for 6-12 months to hedge against price increases.")
 
+        has_delay_risk = any(delay > 10 for delay in supplier_delays.values())
+        has_erosion_risk = any(erosion > 0 for erosion in supplier_erosion_count.values())
+        
+        overall_risk = "CRITICAL" if (has_delay_risk and has_erosion_risk) else (
+            "HIGH" if (high_risk or avg_reliability < 0.70 or has_delay_risk or has_erosion_risk) else "MEDIUM"
+        )
+
         return {
             "agent_name": self.name,
             "analysis": (
                 f"Supplier network: {len(suppliers)} vendors. "
                 f"Average reliability: {avg_reliability:.0%}. "
-                f"{len(high_risk)} high-risk supplier(s) identified."
+                f"{len(high_risk)} high-risk supplier(s) identified. "
+                f"Supply Chain: delays={has_delay_risk}, erosion={has_erosion_risk}."
             ),
             "recommendations": recs[:4],
             "confidence": 0.87,
-            "risk_level": "HIGH" if high_risk or avg_reliability < 0.70 else "MEDIUM",
+            "risk_level": overall_risk,
             "supporting_evidence": evidence,
         }
 
@@ -357,6 +527,16 @@ class CustomerAgent(BaseAgent):
         recs = []
         evidence = []
 
+        # Collections Risk Analysis
+        high_collections_risk = [c for c in customer_risk if c.get("collections_risk_score", 0) > 70.0]
+        if high_collections_risk:
+            for c in high_collections_risk[:2]:
+                recs.append(
+                    f"Customer '{c['name']}' has high collections risk ({c['collections_risk_score']:.0f}/100). "
+                    f"Escalate collections or suspend further credit shipment."
+                )
+                evidence.append(f"High collections risk: {c['name']} ({c['collections_risk_score']:.0f}/100)")
+
         if high_payment_risk:
             recs.append(
                 f"{len(high_payment_risk)} customer(s) have HIGH late payment risk. "
@@ -374,17 +554,20 @@ class CustomerAgent(BaseAgent):
         recs.append("Review payment terms for overdue accounts — consider early payment discounts of 1-2% for prompt payers.")
 
         total_clv = sum(c.get("clv", 0) for c in customer_risk)
+        has_critical_collections = any(c.get("collections_risk_score", 0) > 85.0 for c in customer_risk)
 
         return {
             "agent_name": self.name,
             "analysis": (
                 f"Customer portfolio: Total CLV tracked = ${total_clv:,.2f}. "
                 f"{len(high_payment_risk)} high-payment-risk accounts. "
-                f"{len(low_clv)} low-CLV at-risk accounts."
+                f"{len(high_collections_risk)} high-collections-risk accounts."
             ),
             "recommendations": recs[:4],
             "confidence": 0.83,
-            "risk_level": "HIGH" if len(high_payment_risk) > 3 else "MEDIUM",
+            "risk_level": "CRITICAL" if (len(high_payment_risk) > 3 or has_critical_collections) else (
+                "HIGH" if (high_payment_risk or high_collections_risk) else "MEDIUM"
+            ),
             "supporting_evidence": evidence,
         }
 
@@ -418,6 +601,8 @@ class RiskAgent(BaseAgent):
             risk_signals.append(f"Inventory risk: {len(low_stock)} SKUs below reorder point")
         if any(c.get("churn_probability", 0) > 0.60 for c in customer_risk):
             risk_signals.append("Customer concentration risk: critical accounts showing churn signals")
+        if any(c.get("collections_risk_score", 0) > 70.0 for c in customer_risk):
+            risk_signals.append("Collections risk: customer accounts flagged for payment delinquency")
         if any(s.get("delay_risk") == "HIGH" for s in supplier_risk):
             risk_signals.append("Supply chain risk: high-risk supplier(s) active in critical product lines")
 
@@ -465,6 +650,7 @@ class CEOAgent:
     """
 
     SPECIALIST_AGENTS = [
+        ProcurementAgent(),
         FinanceAgent(),
         OperationsAgent(),
         MarketingAgent(),
@@ -510,6 +696,86 @@ class CEOAgent:
                     "risk_level": "UNKNOWN",
                     "supporting_evidence": [],
                 })
+
+        # Step 3.5: CEO Strategic Growth Brief Generation
+        from app.utils.prompt_builder import PromptBuilder
+        from app.services.ollama_client import OllamaClient
+        from app.models.history import RecommendationHistory
+        import json
+        
+        # Build prompt
+        strategy_prompt = PromptBuilder.build_strategy_brief_prompt(agent_reports, context)
+        
+        strategy_brief_data = None
+        try:
+            strategy_brief_data = await OllamaClient.chat_json(strategy_prompt)
+            required_keys = ["capital_allocation", "next_product_focus", "cost_reductions", "promotional_offers"]
+            if not all(k in strategy_brief_data for k in required_keys):
+                strategy_brief_data = None
+        except Exception as exc:
+            logger.warning("Ollama backend unavailable for CEO strategy brief (%s) — invoking fallback brief.", exc)
+            
+        if not strategy_brief_data:
+            # Fallback Brief Heuristics based on agent analyses
+            cap_alloc = "Allocate 60% of liquid capital to inventory reordering and 40% to buffer cash-flow deficits."
+            cap_cite = "[FinanceAgent]"
+            for rep in agent_reports:
+                if rep["agent_name"] == "FinanceAgent":
+                    cap_alloc = f"Optimize cash balance. {rep['analysis']}"
+                    cap_cite = f"[{rep['agent_name']}]"
+                    break
+                    
+            prod_focus = "Prioritize procurement of raw materials showing high price volatility to lock in lower pricing."
+            prod_cite = "[ProcurementAgent]"
+            for rep in agent_reports:
+                if rep["agent_name"] == "ProcurementAgent":
+                    prod_focus = f"Hedging raw material spot price risks. {rep['analysis']}"
+                    prod_cite = f"[{rep['agent_name']}]"
+                    break
+                    
+            cost_red = "Negotiate fixed-price supply contracts with critical vendors to minimize transportation cost margin erosion."
+            cost_cite = "[SupplierAgent]"
+            for rep in agent_reports:
+                if rep["agent_name"] == "SupplierAgent":
+                    cost_red = f"Remediate margin erosion. {rep['analysis']}"
+                    cost_cite = f"[{rep['agent_name']}]"
+                    break
+                    
+            promo_off = "Launch targeted marketing campaigns and early payment incentives to secure high-CLV customer segments."
+            promo_cite = "[CustomerAgent]"
+            for rep in agent_reports:
+                if rep["agent_name"] == "CustomerAgent":
+                    promo_off = f"Mitigate customer churn. {rep['analysis']}"
+                    promo_cite = f"[{rep['agent_name']}]"
+                    break
+                    
+            strategy_brief_data = {
+                "capital_allocation": cap_alloc,
+                "next_product_focus": prod_focus,
+                "cost_reductions": cost_red,
+                "promotional_offers": promo_off,
+                "supporting_evidence": {
+                    "capital_allocation": f"Grounded in {cap_cite} recommendations.",
+                    "next_product_focus": f"Grounded in {prod_cite} recommendations.",
+                    "cost_reductions": f"Grounded in {cost_cite} recommendations.",
+                    "promotional_offers": f"Grounded in {promo_cite} recommendations."
+                }
+            }
+            
+        # Store in RecommendationHistory
+        rec_obj = RecommendationHistory(
+            agent_name="CEOAgent",
+            recommendation=json.dumps(strategy_brief_data),
+            reasoning=json.dumps(strategy_brief_data.get("supporting_evidence", {})),
+            roi=20.0,
+            confidence=0.90,
+            risk_level="MEDIUM",
+            business_impact="CEO Strategic Briefing Alignment",
+            affected_departments=["Management", "Finance", "Operations", "Sales"],
+            supporting_evidence=list(strategy_brief_data.get("supporting_evidence", {}).values())
+        )
+        db.add(rec_obj)
+        await db.flush()
 
         # Step 4: CEO synthesis
         all_recommendations = []
@@ -564,6 +830,7 @@ class CEOAgent:
             ][:3],
             "agent_reports": agent_reports,
             "all_recommendations": all_recommendations,
+            "strategy_brief": strategy_brief_data,
             "predictions": {
                 "revenue": predictions["revenue"],
                 "cashflow": predictions["cashflow"],
@@ -580,7 +847,7 @@ class CEOAgent:
     def _estimate_roi(report: Dict[str, Any], rec_index: int) -> float:
         """Simple heuristic ROI estimate based on agent type and recommendation position."""
         base_roi = {"FinanceAgent": 25.0, "MarketingAgent": 35.0, "OperationsAgent": 20.0,
-                    "SupplierAgent": 15.0, "CustomerAgent": 30.0, "RiskAgent": 10.0}
+                    "SupplierAgent": 15.0, "CustomerAgent": 30.0, "RiskAgent": 10.0, "ProcurementAgent": 20.0}
         base = base_roi.get(report.get("agent_name", ""), 15.0)
         return round(base * (1 - rec_index * 0.1) * report.get("confidence", 0.7), 1)
 
@@ -593,5 +860,6 @@ class CEOAgent:
             "SupplierAgent": "Supply chain resilience and cost reduction",
             "CustomerAgent": "Customer satisfaction and lifetime value increase",
             "RiskAgent": "Enterprise risk reduction and business continuity",
+            "ProcurementAgent": "Procurement cost savings and margin hedging",
         }
         return impacts.get(report.get("agent_name", ""), "Positive business outcome expected")

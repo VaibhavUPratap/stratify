@@ -14,3 +14,16 @@ from app.models.history import (  # noqa: F401
     DecisionHistory,
     RecommendationHistory,
 )
+from app.models.materials import (  # noqa: F401
+    RawMaterial,
+    MaterialPriceHistory,
+    product_material_association,
+)
+from app.models.supply_chain import (  # noqa: F401
+    PurchaseOrder,
+    TransportationLog,
+)
+from app.models.collections import (  # noqa: F401
+    PaymentHistory,
+)
+

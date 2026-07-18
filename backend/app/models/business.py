@@ -64,6 +64,7 @@ class Customer(Base):
     clv = Column(Float, default=0.0)                     # Customer Lifetime Value (accumulated)
     payment_terms_days = Column(Integer, default=30)
     is_active = Column(Integer, default=1)               # 1=active, 0=churned
+    region = Column(String(100), nullable=True, default="East")  # East | West | North | South
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -144,10 +145,12 @@ class Invoice(Base):
 
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
     supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=True)
+    purchase_order_id = Column(Integer, ForeignKey("purchase_orders.id", ondelete="SET NULL"), nullable=True)
 
     # Relationships
     customer = relationship("Customer", back_populates="invoices")
     supplier = relationship("Supplier", back_populates="invoices")
+    purchase_order = relationship("PurchaseOrder", backref="invoices")
 
 
 class Sales(Base):

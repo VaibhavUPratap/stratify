@@ -26,10 +26,12 @@ from app.schemas.decision import (
     RecommendationsResponse,
     SimulationInput,
     SimulationOutput,
+    StrategyBrief,
 )
 from app.services.agent_engine import CEOAgent
 from app.services.business_memory import BusinessMemoryService
 from app.services.simulation_engine import SimulationEngineService
+import json
 
 router = APIRouter(tags=["Decision Intelligence Engine"])
 logger = logging.getLogger(__name__)
@@ -196,3 +198,37 @@ async def explain_recommendation(recommendation_id: int, db: AsyncSession = Depe
         business_impact=rec.business_impact or "Business impact not specified.",
         affected_departments=rec.affected_departments or [],
     )
+
+
+# ============================================================
+# Strategic Growth Strategy Brief
+# ============================================================
+
+@router.get("/recommendations/strategy", response_model=StrategyBrief)
+async def get_strategy_brief(db: AsyncSession = Depends(get_db)):
+    """Retrieve the latest CEO Strategic Growth Brief."""
+    result = (await db.execute(
+        select(RecommendationHistory)
+        .where(RecommendationHistory.agent_name == "CEOAgent")
+        .order_by(RecommendationHistory.timestamp.desc())
+    )).scalars().first()
+    
+    if not result:
+        # Run CEOAgent pipeline to generate dynamically
+        ceo_res = await _ceo_agent.run(db)
+        brief = ceo_res.get("strategy_brief")
+        if not brief:
+            raise HTTPException(status_code=404, detail="Strategy brief not found")
+        return brief
+        
+    try:
+        data = json.loads(result.recommendation)
+        return StrategyBrief(
+            capital_allocation=data["capital_allocation"],
+            next_product_focus=data["next_product_focus"],
+            cost_reductions=data["cost_reductions"],
+            promotional_offers=data["promotional_offers"],
+            supporting_evidence=data.get("supporting_evidence", {})
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse stored strategy brief: {e}")
